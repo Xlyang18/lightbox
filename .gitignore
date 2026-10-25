@@ -1,0 +1,15 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+release/
+build/icon.iconset/
+
+# 测试产物
+screenshots/results.json
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
