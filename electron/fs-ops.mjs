@@ -202,6 +202,13 @@ export async function applyRenames(renames) {
     return dirCache.get(dir);
   };
 
+  // 本批次「源名 → 目标名」映射：允许 A→B、C→A 这种连环改名
+  // （先腾位后落位的先后顺序由下方两阶段执行保证，不会互相覆盖）
+  // 注意：这里比对的是「文件名」而非完整路径。同目录下的连环改名（A→B、B→A）必须放行。
+  const sourcesLower = new Set(
+    (renames || []).filter((r) => r && r.from).map((r) => path.basename(r.from).normalize('NFC'))
+  );
+
   const valid = [];
   const claimed = new Set(); // 同批次已被占用的目标（防互撞）
   for (const r of renames) {
@@ -213,7 +220,12 @@ export async function applyRenames(renames) {
     const dir = path.dirname(r.from);
     if (path.basename(r.from) === r.to) continue; // 名字未变
     const targetKey = `${dir}::${r.to.normalize('NFC')}`;
-    if (claimed.has(targetKey) || listDir(dir).has(r.to.normalize('NFC'))) {
+    if (claimed.has(targetKey)) {
+      skipped.push({ from: r.from, to: r.to, error: '同批次多个文件改到同一名字，已跳过' });
+      continue;
+    }
+    // 目标已存在：若占用者本身也在本批次内改名（要腾位），允许继续
+    if (listDir(dir).has(r.to.normalize('NFC')) && !sourcesLower.has(r.to.normalize('NFC'))) {
       skipped.push({ from: r.from, to: r.to, error: '目标文件已存在，跳过以避免覆盖' });
       continue;
     }
@@ -221,14 +233,45 @@ export async function applyRenames(renames) {
     valid.push(r);
   }
 
+  // 两阶段执行：先把「要给别人腾位」的源移到临时名，再统一落位。
+  // 否则 A→B、B→C 时先改 A 会撞到尚未腾空的 B。
   const execErrors = [];
+  const moved = []; // { from(原路径), tmp(临时路径), to(目标绝对路径) }
+  const needTemp = valid.filter((r) => {
+    const dir = path.dirname(r.from);
+    const src = path.basename(r.from).normalize('NFC');
+    return (renames || []).some((o) => o && o.from && o.to
+      && path.dirname(o.from) === dir
+      && path.basename(o.from).normalize('NFC') !== src
+      && o.to.normalize('NFC') === src);
+  });
+  const tempSet = new Set(needTemp.map((r) => `${path.dirname(r.from)}::${path.basename(r.from).normalize('NFC')}`));
+
   for (const r of valid) {
-    const target = path.join(path.dirname(r.from), r.to);
+    const dir = path.dirname(r.from);
+    const target = path.join(dir, r.to);
     try {
-      await fs.rename(r.from, target);
-      done.push({ from: r.from, to: target });
+      const src = `${dir}::${path.basename(r.from).normalize('NFC')}`;
+      if (tempSet.has(src)) {
+        const tmp = path.join(dir, `.lightbox-tmp-${crypto.randomUUID()}${path.extname(r.from)}`);
+        await fs.rename(r.from, tmp);
+        moved.push({ from: r.from, tmp, to: target });
+      } else {
+        await fs.rename(r.from, target);
+        done.push({ from: r.from, to: target });
+      }
     } catch (e) {
       execErrors.push({ from: r.from, to: r.to, error: e.message });
+    }
+  }
+  for (const m of moved) {
+    try {
+      await fs.rename(m.tmp, m.to);
+      done.push({ from: m.from, to: m.to });
+    } catch (e) {
+      // 落位失败：尽量放回原名，绝不让文件停留在临时名
+      try { await fs.rename(m.tmp, m.from); } catch { /* 保留临时名，由调用方报错 */ }
+      execErrors.push({ from: m.from, to: path.basename(m.to), error: e.message });
     }
   }
 
@@ -369,6 +412,28 @@ export async function executeBatch({ plan, root, photos, platforms }) {
   result.skipped = ren.skipped || [];
   for (const e of ren.errors || []) result.errors.push({ stage: 'rename', ...e });
   result.rolledBack = ren.rolledBack;
+
+  /**
+   * 原片改名结果（供渲染层增量刷新用）：
+   *  - changes: 真正改成功的 { from, to }
+   *  - gone:    不再存在任何原片路径的文件（被跳过或不存在，界面需按原样保留）
+   *  - reverted: 因整批回滚而回到原名的文件（路径没变，无需重载图片）
+   * 早先版本回滚时直接返回空数组，渲染层会拿旧名字继续找文件，出现「幽灵卡片」。
+   */
+  const changedFrom = new Set(ren.done.map((d) => d.from));
+  const skippedFrom = new Set((ren.skipped || []).map((s) => s.from));
+  const errorFrom = new Set((ren.errors || []).map((e) => e.from));
+  // 只有「整批回滚」时才有 reverted 概念；正常成功时不返回任何幽灵路径
+  let renamesReverted = [];
+  if (ren.rolledBack) {
+    renamesReverted = absoluteRenames.map((r) => r.from).filter((p) => fssync.existsSync(p));
+  }
+  result.renamesApplied = renamesReverted.map((p) => ({ from: p, to: p, reverted: true }));
+  result.renamesChanged = ren.done;
+  result.renamesReverted = renamesReverted;
+  result.renamesUntouched = absoluteRenames
+    .filter((r) => !changedFrom.has(r.from) && (skippedFrom.has(r.from) || errorFrom.has(r.from)))
+    .map((r) => r.from);
 
   return { ...result, renamesPlanned: absoluteRenames };
 }
