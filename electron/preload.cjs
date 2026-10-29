@@ -34,8 +34,8 @@ contextBridge.exposeInMainWorld('lightbox', {
     choosePublishRoot: (photoRoot) => invoke('dialog:choosePublishRoot', photoRoot)
   },
   scan: {
-    folder: (root) => invoke('scan:folder', root),
-    subfolder: (root, rel) => invoke('scan:subfolder', { root, rel })
+    folder: (root, opts = {}) => invoke('scan:folder', { root, force: !!opts.force }),
+    subfolder: (root, rel, opts = {}) => invoke('scan:subfolder', { root, rel, force: !!opts.force })
   },
   photo: {
     thumb: (p) => invoke('photo:thumb', p),
