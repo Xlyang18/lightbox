@@ -48,7 +48,8 @@ export function Modal({ title, subtitle, children, footer, onClose, wide, tall, 
       onMouseDown={(e) => { if (e.target === e.currentTarget) requestClose(); }}
     >
       <div
-        className={`modal ${wide ? 'wide' : ''} ${tall ? 'tall' : ''}`}
+        className={`modal ${wide ? 'wide' : ''} ${tall ? 'tall' : ''} ${closing ? 'closing' : ''}`}
+        aria-busy={closing || undefined}
         style={width || height ? { width: width || undefined, height: height || undefined } : undefined}
         role="dialog"
         aria-label={title}
@@ -132,6 +133,7 @@ export function BatchModal({ photos, platforms, publishRoot, onClose, onExecute 
         note
       });
       setBusy(false);
+      // 部分失败也关闭弹窗（结果已通过 toast 告知），否则用户会以为没执行又点一次
       if (res) onClose();
     } catch (e) {
       setError(String(e.message || e));
@@ -246,18 +248,30 @@ export function BatchModal({ photos, platforms, publishRoot, onClose, onExecute 
   );
 }
 
-/** 全屏预览 */
-export function Lightbox({ photos, startId, platforms, onClose, onTogglePlatform }) {
-  const [idx, setIdx] = useState(() => Math.max(0, photos.findIndex((p) => p.id === startId)));
+/**
+ * 全屏预览
+ * list 为「当前视图」的照片序列（与网格顺序一致），startId 为起点。
+ * 早先版本传入的是全集，导致在某个子目录里打开预览时左右键会翻到别的目录去。
+ */
+export function Lightbox({ list, photos, startId, platforms, shortcuts, onClose, onTogglePlatform }) {
+  const seq = list && list.length ? list : (photos || []);
+  const [idx, setIdx] = useState(() => Math.max(0, seq.findIndex((p) => p.id === startId)));
   const [src, setSrc] = useState(null);
   const [err, setErr] = useState(null);
   const [zoom, setZoom] = useState(1);
   const [closing, setClosing] = useState(false);
+  const closingRef = useRef(false);
 
-  const cur = photos[idx];
+  const safeIdx = Math.max(0, Math.min(idx, seq.length - 1));
+  const cur = seq[safeIdx];
+  useEffect(() => {
+    // 序列变化（例如预览里取消标记后重新扫描）时把索引夹回合法范围，避免空白画面
+    if (seq.length && idx > seq.length - 1) setIdx(seq.length - 1);
+  }, [seq.length, idx]);
 
   const requestClose = () => {
-    if (closing) return;
+    if (closingRef.current) return;
+    closingRef.current = true;
     setClosing(true);
     setTimeout(() => onClose(), CLOSE_MS);
   };
@@ -279,38 +293,55 @@ export function Lightbox({ photos, startId, platforms, onClose, onTogglePlatform
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === 'Escape') requestClose();
-      else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') setIdx((i) => Math.min(photos.length - 1, i + 1));
+      else if (e.key === 'ArrowRight' || e.key === 'ArrowDown') setIdx((i) => Math.min(seq.length - 1, i + 1));
       else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') setIdx((i) => Math.max(0, i - 1));
+      else if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); setZoom((z) => (z === 1 ? 2 : 1)); }
+      else if (e.key === '+' || e.key === '=') setZoom((z) => Math.min(4, Math.round((z + 0.5) * 10) / 10));
+      else if (e.key === '-') setZoom((z) => Math.max(1, Math.round((z - 0.5) * 10) / 10));
       else {
-        const pf = platforms.find((p) => p.shortcut === e.key && p.enabled !== false);
+        const pf = platforms.find((p) => String(p.shortcut) === e.key && p.enabled !== false);
         if (pf && cur) onTogglePlatform([cur], pf.id);
       }
       e.stopPropagation();
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [photos.length, cur, platforms, onTogglePlatform, closing]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seq.length, cur, platforms, onTogglePlatform]);
 
   if (!cur) return null;
+  const atStart = safeIdx <= 0;
+  const atEnd = safeIdx >= seq.length - 1;
   return (
     <div className={`lightbox ${closing ? 'closing' : ''}`} onClick={(e) => { if (e.target.classList.contains('lightbox-stage')) requestClose(); }}>
       <div className="lightbox-stage">
         {src ? (
           <img
+            key={cur.path}
             src={src}
             alt={cur.name}
+            className={zoom > 1 ? 'zoomed' : ''}
             style={{ transform: `scale(${zoom})`, cursor: zoom > 1 ? 'zoom-out' : 'zoom-in' }}
-            onClick={() => setZoom((z) => (z === 1 ? 2 : 1))}
+            onClick={(e) => { e.stopPropagation(); setZoom((z) => (z === 1 ? 2 : 1)); }}
           />
         ) : (
-          <div style={{ color: 'rgba(255,255,255,0.7)', fontSize: 13 }}>{err || '加载中…'}</div>
+          <div className="lb-hint" style={{ color: 'rgba(255,255,255,0.7)', fontSize: 13 }}>{err || '加载中…'}</div>
         )}
-        <button className="lb-nav left" onClick={() => setIdx((i) => Math.max(0, i - 1))}>‹</button>
-        <button className="lb-nav right" onClick={() => setIdx((i) => Math.min(photos.length - 1, i + 1))}>›</button>
+        <button
+          className="lb-nav left"
+          disabled={atStart}
+          onClick={(e) => { e.stopPropagation(); setIdx((i) => Math.max(0, i - 1)); }}
+        >‹</button>
+        <button
+          className="lb-nav right"
+          disabled={atEnd}
+          onClick={(e) => { e.stopPropagation(); setIdx((i) => Math.min(seq.length - 1, i + 1)); }}
+        >›</button>
       </div>
-      <div className="lightbox-bar">
-        <span className="lb-name">{cur.name}</span>
-        <span style={{ opacity: 0.5 }}>{idx + 1} / {photos.length}</span>
+      <div className="lightbox-bar" onClick={(e) => e.stopPropagation()}>
+        <span className="lb-name" title={cur.name}>{cur.name}</span>
+        <span style={{ opacity: 0.55 }}>{safeIdx + 1} / {seq.length}</span>
+        <span className="lb-tip">← → 翻页 · 空格 缩放 · 数字键 打标 · Esc 退出</span>
         <div style={{ flex: 1 }} />
         {platforms.filter((p) => p.enabled !== false).map((p) => (
           <button
