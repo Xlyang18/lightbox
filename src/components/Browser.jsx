@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
-import { matchShortcut } from '../lib/core.mjs';
+
 
 const api = window.lightbox;
 
@@ -65,9 +65,21 @@ async function loadThumb(path) {
   return job;
 }
 
+const ORIGINAL_URL = (p) => `file://${encodeURI(p).replace(/#/g, '%23')}`;
+
 export function Thumb({ path, alt, className }) {
   const [src, setSrc] = useState(() => thumbCache.get(thumbKey(path)) || null);
+  // 缩略图还在排队/生成时，先直接显示原图（浏览器自带缩放），避免大图库长时间只看到占位点
+  const [eager, setEager] = useState(null);
   const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!path) { setEager(null); return undefined; }
+    if (thumbCache.has(thumbKey(path))) { setEager(null); return undefined; }
+    // 延迟 160ms 才插原图：命中缓存快的图不会闪一下原图，大图也不会白等
+    const t = setTimeout(() => setEager(ORIGINAL_URL(path)), 160);
+    return () => clearTimeout(t);
+  }, [path]);
 
   useEffect(() => {
     let alive = true;
@@ -94,20 +106,24 @@ export function Thumb({ path, alt, className }) {
       </div>
     );
   }
+  const shown = src || eager;
   return (
-    <div className={className}>
-      {src
-        ? <img src={src} alt={alt || ''} draggable={false} loading="lazy" />
+    <div className={`${className} ${src ? 'is-ready' : ''}`}>
+      {shown
+        ? <img src={shown} alt={alt || ''} draggable={false} loading="lazy" decoding="async" />
         : <span className="placeholder" style={{ opacity: 0.25 }}>·</span>}
     </div>
   );
 }
 
 /* ---------------- 照片卡片 ---------------- */
-export function PhotoCard({
-  photo, selected, focused, platforms, columns, onClick, onQuickToggle, density
+/**
+ * 网格可能一次渲染上千张卡片，单张卡片只在自身状态变化时才重绘。
+ * 注意：回调必须来自上层 useCallback，否则 memo 失效（这里已保证）。
+ */
+export const PhotoCard = React.memo(function PhotoCard({
+  photo, selected, focused, platforms, onClick, onQuickToggle, onOpenPreview
 }) {
-  const clickTimer = useRef(null);
   return (
     <div
       className={`photo-card ${selected ? 'selected' : ''} ${focused ? 'focused' : ''}`}
@@ -167,7 +183,7 @@ export function PhotoCard({
       </div>
     </div>
   );
-}
+});
 
 /* ---------------- 文件夹树 ---------------- */
 function TreeNode({ node, depth, currentRel, expanded, onToggle, onSelect }) {
@@ -208,7 +224,17 @@ function TreeNode({ node, depth, currentRel, expanded, onToggle, onSelect }) {
 }
 
 export function Sidebar({ tree, currentRel, onSelect, collapsed }) {
+  // 首次进入默认展开根节点与它的第一层子目录：多级目录一眼可见，不用先点开再找
   const [expanded, setExpanded] = useState(() => new Set(['']));
+  useEffect(() => {
+    if (!tree?.children?.length) return;
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      next.add('');
+      for (const c of tree.children) next.add(c.relPath);
+      return next;
+    });
+  }, [tree?.relPath, tree?.children?.length]);
   const toggle = useCallback((rel) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -270,29 +296,68 @@ export function PhotoGrid({
     gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`
   }), [columns]);
 
-  const handleClick = (e, photo) => {
-    const idx = photos.findIndex((p) => p.id === photo.id);
+  // 用 ref 持有「最新值」，让卡片回调函数引用长期稳定（配合 React.memo 避免全网格重绘）
+  const live = useRef({});
+  live.current = { photos, selection, onSelectionChange, onFocusChange, onQuickToggle, onOpenPreview };
+
+  const handleClick = useCallback((e, photo) => {
+    const L = live.current;
+    const list = L.photos || [];
+    const sel = L.selection || new Set();
+    const idx = list.findIndex((p) => p.id === photo.id);
     const isMeta = e.metaKey || e.ctrlKey;
     const isShift = e.shiftKey;
+    const anchor = lastClickIdx.current;
 
-    if (isShift && lastClickIdx.current != null) {
-      const a = Math.min(lastClickIdx.current, idx);
-      const b = Math.max(lastClickIdx.current, idx);
-      const range = photos.slice(a, b + 1).map((p) => p.id);
-      const next = new Set(isMeta ? [...selection] : []);
-      range.forEach((id) => next.add(id));
-      onSelectionChange(next);
+    if (isShift && anchor != null && idx >= 0) {
+      const a = Math.min(anchor, idx);
+      const b = Math.max(anchor, idx);
+      const next = new Set(isMeta ? [...sel] : []);
+      for (let i = a; i <= b; i += 1) next.add(list[i].id);
+      L.onSelectionChange(next);
     } else if (isMeta) {
-      const next = new Set(selection);
+      const next = new Set(sel);
       if (next.has(photo.id)) next.delete(photo.id);
       else next.add(photo.id);
-      onSelectionChange(next);
+      L.onSelectionChange(next);
       lastClickIdx.current = idx;
     } else {
-      onSelectionChange(new Set([photo.id]));
+      L.onSelectionChange(new Set([photo.id]));
       lastClickIdx.current = idx;
     }
-    onFocusChange(photo.id);
+    L.onFocusChange(photo.id);
+  }, []);
+
+  const openPreview = useCallback((id) => live.current.onOpenPreview?.(id), []);
+
+  /* 拖框实时高亮：拖动中就把命中的卡片标成临时选中（视觉跟随手感） */
+  const markLive = (m, additive, baseSel) => {
+    const wrap = wrapRef.current;
+    if (!wrap || !m) return;
+    const x1 = Math.min(m.x1, m.x2);
+    const x2 = Math.max(m.x1, m.x2);
+    const y1 = Math.min(m.y1, m.y2);
+    const y2 = Math.max(m.y1, m.y2);
+    const rect = wrap.getBoundingClientRect();
+    const hits = new Set();
+    wrap.querySelectorAll('.photo-card').forEach((n) => {
+      const r = n.getBoundingClientRect();
+      const nx1 = r.left - rect.left + wrap.scrollLeft;
+      const ny1 = r.top - rect.top + wrap.scrollTop;
+      const nx2 = nx1 + r.width;
+      const ny2 = ny1 + r.height;
+      const hit = !(nx2 < x1 || nx1 > x2 || ny2 < y1 || ny1 > y2);
+      n.classList.toggle('marquee-hit', hit);
+      if (hit && n.dataset.photoId) hits.add(n.dataset.photoId);
+    });
+    if (additive && baseSel) baseSel.forEach((id) => hits.add(id));
+    return hits;
+  };
+
+  const clearLive = () => {
+    if (!wrapRef.current) return;
+    wrapRef.current.querySelectorAll('.photo-card.marquee-hit')
+      .forEach((n) => n.classList.remove('marquee-hit'));
   };
 
   const onGridMouseDown = (e) => {
@@ -307,56 +372,64 @@ export function PhotoGrid({
     setMarquee({ x1: start.x, y1: start.y, x2: start.x, y2: start.y });
   };
 
+  // 拖框：用一个稳定的 latest ref 记住最新矩形，避免每次 mousemove 都重建监听、也避免松手时拿到旧值
+  const marqueeRef = useRef(null);
+  marqueeRef.current = marquee;
+  const dragging = marquee !== null;
+
   useEffect(() => {
-    if (!marquee) return;
+    if (!dragging) return undefined;
+    let raf = 0;
     const onMove = (e) => {
-      if (!dragState.current) return;
+      if (!dragState.current || !wrapRef.current) return;
       const rect = wrapRef.current.getBoundingClientRect();
       const cur = {
         x: e.clientX - rect.left + wrapRef.current.scrollLeft,
         y: e.clientY - rect.top + wrapRef.current.scrollTop
       };
-      setMarquee((m) => (m ? { ...m, x2: cur.x, y2: cur.y } : m));
+      const m = { ...marqueeRef.current, x2: cur.x, y2: cur.y };
+      marqueeRef.current = m;
+      // 合并到下一帧：拖动时只按帧更新，长图库也不掉帧
+      if (!raf) {
+        raf = requestAnimationFrame(() => {
+          raf = 0;
+          const cur2 = marqueeRef.current;
+          if (!cur2) return;
+          setMarquee(cur2);
+          const st = dragState.current;
+          if (st && (Math.abs(cur2.x2 - cur2.x1) >= 3 || Math.abs(cur2.y2 - cur2.y1) >= 3)) {
+            markLive(cur2, st.additive, st.baseSel);
+          }
+        });
+      }
     };
     const onUp = () => {
-      const m = marquee;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      const m = marqueeRef.current;
+      const st = dragState.current;
       // 零面积（只是点了一下空白）不算框选：视为「取消全部选择」
       const isClick = m && Math.abs(m.x2 - m.x1) < 3 && Math.abs(m.y2 - m.y1) < 3;
+      clearLive();
       if (isClick) {
-        if (!dragState.current?.additive) onSelectionChange(new Set());
-        dragState.current = null;
-        setMarquee(null);
-        return;
+        if (!st?.additive) live.current.onSelectionChange(new Set());
+      } else if (st && m) {
+        const hits = markLive(m, st.additive, st.baseSel) || new Set();
+        if (st.additive && st.baseSel) st.baseSel.forEach((id) => hits.add(id));
+        live.current.onSelectionChange(hits);
       }
-      if (dragState.current && m) {
-        const x1 = Math.min(m.x1, m.x2);
-        const x2 = Math.max(m.x1, m.x2);
-        const y1 = Math.min(m.y1, m.y2);
-        const y2 = Math.max(m.y1, m.y2);
-        const rect = wrapRef.current.getBoundingClientRect();
-        const base = dragState.current.additive ? new Set(dragState.current.baseSel) : new Set();
-        const nodes = wrapRef.current.querySelectorAll('.photo-card');
-        nodes.forEach((n) => {
-          const r = n.getBoundingClientRect();
-          const nx1 = r.left - rect.left + wrapRef.current.scrollLeft;
-          const ny1 = r.top - rect.top + wrapRef.current.scrollTop;
-          const nx2 = nx1 + r.width;
-          const ny2 = ny1 + r.height;
-          const hit = !(nx2 < x1 || nx1 > x2 || ny2 < y1 || ny1 > y2);
-          if (hit && n.dataset.photoId) base.add(n.dataset.photoId);
-        });
-        onSelectionChange(base);
-      }
+      clearLive();
       dragState.current = null;
+      marqueeRef.current = null;
       setMarquee(null);
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
     return () => {
+      if (raf) cancelAnimationFrame(raf);
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
     };
-  }, [marquee, onSelectionChange]);
+  }, [dragging]);
 
   const mStyle = marquee ? {
     left: Math.min(marquee.x1, marquee.x2),
@@ -391,9 +464,9 @@ export function PhotoGrid({
               selected={selection.has(p.id)}
               focused={focusedId === p.id}
               platforms={platforms}
-              columns={columns}
               onClick={handleClick}
               onQuickToggle={onQuickToggle}
+              onOpenPreview={openPreview}
             />
           ))}
         </div>
@@ -409,8 +482,10 @@ export function Inspector({ photo, platforms, onTogglePlatform, selectionCount, 
   const [exif, setExif] = useState(null);
   useEffect(() => {
     let alive = true;
-    if (!photo) { setExif(null); return; }
-    api.photo.exif(photo.path).then((x) => { if (alive) setExif(x); });
+    // 切换照片时先清空，避免上一张的尺寸/体积短暂挂在下一张名下
+    setExif(null);
+    if (!photo) return () => { alive = false; };
+    api.photo.exif(photo.path).then((x) => { if (alive) setExif(x); }).catch(() => {});
     return () => { alive = false; };
   }, [photo?.path]);
 
