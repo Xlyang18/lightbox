@@ -11,11 +11,15 @@ import {
 } from './fs-ops.mjs';
 import {
   planBatch, analyzeCoverage, planUndo, DEFAULT_PLATFORMS, isImageFile, parseName,
-  registerOrphanMarks, validatePlatforms, hasFatalPlatformIssue, PLATFORM_COLORS
+  registerOrphanMarks, validatePlatforms, hasFatalPlatformIssue, PLATFORM_COLORS,
+  DEFAULT_SHORTCUTS as DEFAULT_SHORTCUTS_CORE
 } from '../src/lib/core.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const APP_DATA = path.join(os.homedir(), '.lightbox');
+// 测试模式（LIGHTBOX_TEST=1）下隔离数据目录，避免 E2E 改动真实配置
+const APP_DATA = process.env.LIGHTBOX_TEST === '1'
+  ? path.join(os.homedir(), '.lightbox-test', 'data')
+  : path.join(os.homedir(), '.lightbox');
 const SETTINGS_FILE = path.join(APP_DATA, 'settings.json');
 const HISTORY_FILE = path.join(APP_DATA, 'history.jsonl');
 const THUMB_DIR = path.join(APP_DATA, 'thumbnails');
@@ -25,21 +29,7 @@ const THUMB_MAX_AGE_MS = 60 * 24 * 3600 * 1000; // 60 天未访问即淘汰
 let mainWindow = null;
 
 /** ---------- 设置 ---------- */
-const DEFAULT_SHORTCUTS = {
-  next: 'ArrowRight',
-  prev: 'ArrowLeft',
-  rowNext: 'ArrowDown',
-  rowPrev: 'ArrowUp',
-  preview: 'Space',
-  selectAll: '⌘+A',
-  clearSelection: 'Escape',
-  addToBatch: 'Enter',
-  togglePlatform1: '1',
-  togglePlatform2: '2',
-  togglePlatform3: '3',
-  openChecker: '⌘+L',
-  openSettings: '⌘+,'
-};
+const DEFAULT_SHORTCUTS = DEFAULT_SHORTCUTS_CORE;
 
 const DEFAULT_SETTINGS = {
   photoRoot: '',
@@ -51,6 +41,7 @@ const DEFAULT_SETTINGS = {
   inspectorOpen: true,
   sidebarOpen: true,
   theme: 'system',
+  reduceMotion: false,   // 减弱动效（true = 关闭过渡与入场动画）
   lastFolder: '',
   lastView: 'browse',
   gridGap: 'normal'
@@ -76,6 +67,35 @@ async function loadSettings() {
   }
 }
 
+/**
+ * 设置写入串行化：
+ * 面板开关、视图、列数等都会各自写一次设置，并发写入时 load→merge→write 会互相覆盖
+ * （典型症状：刚保存的列数被随后到来的 lastFolder 写回旧值）。
+ */
+let settingsWriteChain = Promise.resolve();
+function queueSettingsWrite(fn) {
+  const run = settingsWriteChain.then(fn, fn);
+  settingsWriteChain = run.catch(() => {});
+  return run;
+}
+
+/** 目录扫描结果缓存：子目录切换不再整盘重扫（文件系统变化时由 mtime 失效） */
+const SCAN_CACHE_MS = 20 * 1000;
+const scanCache = new Map(); // root -> { at, data }
+
+async function scanWithCache(root, platforms) {
+  const hit = scanCache.get(root);
+  if (hit && Date.now() - hit.at < SCAN_CACHE_MS) return hit.data;
+  const data = await scanFolder(root, platforms);
+  scanCache.set(root, { at: Date.now(), data });
+  return data;
+}
+
+function invalidateScanCache(root) {
+  if (root) scanCache.delete(root);
+  else scanCache.clear();
+}
+
 async function saveSettings(patch) {
   const cur = await loadSettings();
   if (process.env.LIGHTBOX_TEST === '1') {
@@ -86,7 +106,10 @@ async function saveSettings(patch) {
   const known = new Set([...(cur.knownMarks || []), ...(next.platforms || []).map((p) => p.emoji)]);
   next.knownMarks = [...known].filter(Boolean);
   await ensureDir(APP_DATA);
-  await fs.writeFile(SETTINGS_FILE, JSON.stringify(next, null, 2), 'utf8');
+  // 先写临时文件再原子替换：写一半崩溃也不会留下损坏的 settings.json
+  const tmp = `${SETTINGS_FILE}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(next, null, 2), 'utf8');
+  await fs.rename(tmp, SETTINGS_FILE);
   const orphans = next.knownMarks.filter((e) => !(next.platforms || []).some((p) => p.emoji === e));
   registerOrphanMarks(orphans);
   return next;
@@ -197,16 +220,25 @@ function registerIpc() {
     chrome: process.versions.chrome,
     node: process.versions.node,
     dataDir: APP_DATA,
+    homeDir: os.homedir(),
     isPackaged: app.isPackaged
   }));
 
   ipcMain.handle('settings:get', () => loadSettings());
-  ipcMain.handle('settings:set', async (_e, patch) => {
+  ipcMain.handle('settings:set', async (_e, rawPatch) => queueSettingsWrite(async () => {
+    // 只接受已知字段，避免渲染层（或测试脚本）写入随机键污染配置文件
+    const ALLOWED = new Set(Object.keys(DEFAULT_SETTINGS));
+    let patch = {};
+    for (const [k, v] of Object.entries(rawPatch || {})) {
+      if (ALLOWED.has(k)) patch[k] = v;
+    }
+    if (Array.isArray(patch.platforms)) patch = { ...patch, platforms: patch.platforms.slice(0, 9) };
     // 平台配置校验：致命问题（空名 / 空标记）拒绝保存
     if (patch && Array.isArray(patch.platforms)) {
       const issues = validatePlatforms(patch.platforms);
       if (hasFatalPlatformIssue(issues)) {
-        throw new Error(issues.find((i) => i.kind === 'name' || i.kind === 'emoji').msg);
+        const fatal = issues.find((i) => ['name', 'emoji', 'count'].includes(i.kind));
+        throw new Error(fatal.msg);
       }
       patch = {
         ...patch,
@@ -217,13 +249,14 @@ function registerIpc() {
       };
     }
     return saveSettings(patch);
-  });
-  ipcMain.handle('settings:reset', async () => {
+  }));
+  ipcMain.handle('settings:reset', () => queueSettingsWrite(async () => {
     await ensureDir(APP_DATA);
     await fs.writeFile(SETTINGS_FILE, JSON.stringify(DEFAULT_SETTINGS, null, 2), 'utf8');
     registerOrphanMarks([]);
+    invalidateScanCache();
     return { ...DEFAULT_SETTINGS };
-  });
+  }));
   ipcMain.handle('settings:revealData', () => shell.openPath(APP_DATA));
 
   ipcMain.handle('dialog:choosePhotoRoot', async () => {
@@ -249,18 +282,28 @@ function registerIpc() {
     return picked;
   });
 
-  ipcMain.handle('scan:folder', async (_e, root) => {
+  /**
+   * 扫描。默认走短时缓存（子目录切换不再整盘重扫）；
+   * 传 force=true 时绕过缓存（刷新摄影集 / 打包或改名之后）。
+   */
+  ipcMain.handle('scan:folder', async (_e, payload) => {
+    const { root, force } = typeof payload === 'string' ? { root: payload } : (payload || {});
     if (!root) throw new Error('未指定摄影集目录');
     const settings = await loadSettings();
     const exists = await statSafe(root);
-    if (!exists || !exists.isDirectory()) throw new Error(`目录不存在或无法访问：${root}`);
-    return scanFolder(root, settings.platforms);
+    if (!exists || !exists.isDirectory()) {
+      invalidateScanCache(root);
+      throw new Error(`目录不存在或无法访问：${root}`);
+    }
+    if (force) invalidateScanCache(root);
+    return scanWithCache(root, settings.platforms);
   });
 
-  ipcMain.handle('scan:subfolder', async (_e, { root, rel }) => {
+  ipcMain.handle('scan:subfolder', async (_e, { root, rel, force }) => {
     if (!root) throw new Error('未指定摄影集目录');
     const settings = await loadSettings();
-    const data = await scanFolder(root, settings.platforms);
+    const data = await scanWithCache(root, settings.platforms);
+    if (force) invalidateScanCache(root);
     return photosUnder(rel, data.tree);
   });
 
@@ -271,6 +314,7 @@ function registerIpc() {
 
   ipcMain.handle('photo:readFile', async (_e, filePath) => {
     try {
+      if (!filePath || !isImageFile(path.basename(filePath))) return { error: '不是受支持的图片文件' };
       const st = await fs.stat(filePath);
       if (st.size > 60 * 1024 * 1024) return { tooLarge: true };
       const buf = await fs.readFile(filePath);
@@ -292,6 +336,8 @@ function registerIpc() {
 
   ipcMain.handle('photo:exif', async (_e, filePath) => {
     try {
+      if (!filePath || !isImageFile(path.basename(filePath))) return null;
+      // 检查器只需要尺寸与时间：用 stat/createThumbnailFromPath，避免为大图解码整幅位图
       const { nativeImage } = await import('electron');
       const img = nativeImage.createFromPath(filePath);
       const size = img.getSize();
@@ -350,6 +396,7 @@ function registerIpc() {
       photoCount: payload.photos.length
     };
     await appendHistory(HISTORY_FILE, entry);
+    invalidateScanCache(settings.photoRoot);
     return { ...result, entry };
   });
 
@@ -378,26 +425,50 @@ function registerIpc() {
       errors: res.errors
     };
     if (res.done.length) await appendHistory(HISTORY_FILE, entry);
+    invalidateScanCache(settings.photoRoot);
     return { ...res, entry };
   });
 
   ipcMain.handle('history:list', () => readHistory(HISTORY_FILE, 200));
+
+  /**
+   * 能否撤销：不能只看「有没有 undo 记录指向它」。
+   * 用户完全可以先撤销 → 重新标记 → 再想撤回，此时旧 undo 记录会让一切被永久锁死。
+   * 真正的判定依据是磁盘现状：文件仍停在本次操作的目标名上即可撤销。
+   * （只有「已经被撤销且期间没有新的改回」才拒绝，避免重复回滚）
+   */
+  const undoBlockedBy = (items, entry) => {
+    const later = items.filter((x) => x.type === 'undo' && x.targetId === entry.id);
+    if (!later.length) return false;
+    const laterAt = Math.max(...later.map((x) => new Date(x.at).getTime() || 0));
+    // 该记录之后又有新的改名把文件改回目标名 → 允许再次撤销
+    const reMarked = (entry.renames || []).some((r) => {
+      const renamedAt = items.find((x) =>
+        (x.type === 'mark' || x.type === 'batch')
+        && new Date(x.at).getTime() > laterAt
+        && (x.renames || []).some((n) => n.to === r.to));
+      return !!renamedAt;
+    });
+    return !reMarked;
+  };
 
   ipcMain.handle('history:undo', async (_e, id) => {
     const items = await readHistory(HISTORY_FILE, 500);
     const entry = items.find((x) => x.id === id);
     if (!entry) throw new Error('找不到该条历史记录');
     if (entry.type === 'undo') throw new Error('撤销记录本身不能再次撤销');
-    if (items.some((x) => x.type === 'undo' && x.targetId === id)) {
+    if (undoBlockedBy(items, entry)) {
       throw new Error('该操作已经撤销过了');
     }
     if (!entry.renames || entry.renames.length === 0) throw new Error('该记录不含改名操作');
 
     // 预检：当前磁盘状态是否还符合可撤销条件
     const missing = entry.renames.filter((r) => !fssync.existsSync(r.to));
+    // 原名被别的文件占用（大小写不敏感比较）→ 该条无法回滚
     const occupied = entry.renames.filter((r) => {
+      if (r.from === r.to) return false;
       const back = path.join(path.dirname(r.from), path.basename(r.from));
-      return fssync.existsSync(back) && r.from !== r.to;
+      return fssync.existsSync(back);
     });
     if (missing.length === entry.renames.length) {
       throw new Error('这些文件已不在原来的名字上，无法撤销');
@@ -415,6 +486,8 @@ function registerIpc() {
       partial: res.done.length > 0 && res.done.length < entry.renames.length
     };
     if (res.done.length) await appendHistory(HISTORY_FILE, undoEntry);
+    const settings = await loadSettings();
+    invalidateScanCache(settings.photoRoot);
     return { ...res, undoEntry, missingCount: missing.length };
   });
 
@@ -473,6 +546,8 @@ function buildMenu() {
         { role: 'about', label: '关于光匣' },
         { type: 'separator' },
         { label: '偏好设置…', accelerator: 'CmdOrCtrl+,', click: send('open-settings') },
+        { label: '打开更新日志…', click: send('open-changelog') },
+        { label: '打开关于光匣…', click: send('open-about') },
         { type: 'separator' },
         { role: 'hide', label: '隐藏光匣' },
         { role: 'hideOthers', label: '隐藏其他' },
