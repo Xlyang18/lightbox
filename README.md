@@ -5,7 +5,8 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20arm64-black)](https://github.com/Xlyang18/lightbox)
 [![Electron](https://img.shields.io/badge/Electron-31-47848F)](https://www.electronjs.org/)
 [![React](https://img.shields.io/badge/React-18-61DAFB)](https://react.dev/)
-[![Tests](https://img.shields.io/badge/tests-150%20passed-brightgreen)](TEST-REPORT.md)
+[![Tests](https://img.shields.io/badge/tests-89%20unit%E2%80%AF%C2%B7%E2%80%AF80%20e2e-brightgreen)](TEST-REPORT.md)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 光匣不替你上传照片，它替你**记账**。它扫描你的摄影集目录，让你用键盘快速选片、一键标记哪些批次要发到哪个平台，然后把选中的照片打包复制到你的「待发布」文件夹，并在原片文件名尾部追加平台色点标记 —— 一眼就能看出整套片子里哪些发过、哪些还没发。
@@ -16,6 +17,7 @@
 
 ## 目录
 
+- [下载](#下载)
 - [它解决什么问题](#它解决什么问题)
 - [核心概念](#核心概念)
 - [界面导览](#界面导览)
@@ -26,6 +28,21 @@
 - [开发](#开发)
 - [测试](#测试)
 - [已知限制](#已知限制)
+
+---
+
+## 下载
+
+前往 [**Releases**](https://github.com/Xlyang18/lightbox/releases/latest) 下载最新版本：
+
+| 文件 | 适用机型 |
+|---|---|
+| `lightbox-1.2.0-arm64.dmg` | Apple Silicon（M1/M2/M3/M4） |
+
+**首次打开被系统拦截？** 本项目未做 Apple 公证，会提示「无法验证开发者」。任选其一：
+
+- 在 Finder 里 **右键 → 打开**，再点「打开」
+- 或终端执行：`xattr -dr com.apple.quarantine /Applications/光匣.app`
 
 ---
 
@@ -138,9 +155,9 @@ DSC01234🔴🟢🔵.JPG        ← 三个平台都发了
 | 单击 | 选中一张（替换原选择） |
 | `Shift` + 单击 | 从上次点击处连选 |
 | `⌘` + 单击 | 加选/减选单张 |
-| 在空白处拖动 | 框选（浅蓝选框） |
+| 在空白处拖动 | 框选（拖动过程中实时高亮命中项） |
 | `⌘A` | 全选当前视图 |
-| `Esc` | 清空选择 |
+| `Esc` | 有搜索结果时先退出搜索，再按一次清空选择 |
 
 ![框选](screenshots/07-拖框选择.png)
 
@@ -164,9 +181,9 @@ DSC01234🔴🟢🔵.JPG        ← 三个平台都发了
 
 按 `空格` 或检查器里的「全屏预览」按钮进入。
 
-- `←` `→` 切换上下张
+- `←` `→` 切换上下张（**只在当前目录内翻页**，不会跳到别的文件夹）
 - `1` `2` `3` 直接打标（预览条上也能点）
-- 点击图片放大 2×，再点还原
+- 点击图片放大 2×，再点还原；`空格` / `+` / `-` 也能缩放（1×–4×）
 - `Esc` 退出
 
 ![全屏预览](screenshots/14-全屏预览.png)
@@ -216,11 +233,11 @@ DSC01234🔴🟢🔵.JPG        ← 三个平台都发了
 - **更新日志**：全部版本的变更记录，含本次修复清单
 - **关于**：版本、功能说明、运行环境、数据安全承诺
 
-![关于](screenshots/38-设置-关于.png)
+### 8. 关于与更新日志
 
-### 8. 更新日志
+「设置 → 关于」介绍软件定位、功能一览、运行环境与数据安全承诺；「设置 → 更新日志」用生活化的口吻记录每个版本的改动。两者也可以从菜单栏 **光匣 → 打开关于光匣 / 打开更新日志…** 直达。
 
-![更新日志](screenshots/37-设置-更新日志.png)
+<img src="screenshots/38-设置-关于.png" width="49%"> <img src="screenshots/37-设置-更新日志.png" width="49%">
 
 ### 9. 撤销
 
@@ -241,7 +258,7 @@ DSC01234🔴🟢🔵.JPG        ← 三个平台都发了
 | `Shift` + 方向键 | 扩展选择 |
 | `空格` | 全屏预览 |
 | `⌘A` | 全选当前视图 |
-| `Esc` | 清空选择 / 退出预览 |
+| `Esc` | 退出搜索 / 清空选择 / 退出预览（逐层后退） |
 | `Enter` | 选中项加入发布包 |
 | `1` `2` `3` | 切换对应平台的标记 |
 | `⌘,` | 打开设置 |
@@ -262,6 +279,8 @@ DSC01234🔴🟢🔵.JPG        ← 三个平台都发了
 4. **执行期失败自动回滚** —— 若批量改名过程中出现执行级错误，本次已完成的改名会全部反向还原。
 5. **待发布目录不能位于摄影集内部** —— 主进程强制校验，避免自我覆盖。
 6. **完整审计日志** —— 每次改名、打包、撤销都追加写入 `~/.lightbox/history.jsonl`，永不覆盖。
+7. **界面只反映磁盘真相** —— 批量改名中若有文件因重名被跳过、或整批回滚，界面不会"假装成功"，只会显示磁盘上实际发生的变化。
+8. **界面路径脱敏** —— 设置页把主目录显示为 `~`，截图/录屏/贴 Issue 时不会泄露用户名。
 
 ### 数据存放
 
@@ -305,7 +324,9 @@ npm run dev        # 构建 + 启动 Electron
 │   │   ├── Browser.jsx  # 目录树、照片网格、检查器
 │   │   ├── Dialogs.jsx  # 打包弹窗、全屏预览、Toast
 │   │   ├── Checker.jsx  # 漏发检查
-│   │   └── Settings.jsx # 设置
+│   │   ├── Settings.jsx # 设置（含关于 / 更新日志页签）
+│   │   ├── About.jsx    # 关于页与更新日志渲染
+│   │   └── changelog.mjs# 版本变更文案（关于页数据源）
 │   ├── App.jsx          # 应用外壳与全部状态
 │   ├── main.jsx
 │   └── styles.css       # 设计系统（Apple 风格变量）
@@ -316,8 +337,10 @@ npm run dev        # 构建 + 启动 Electron
 │   ├── e2e-scenario.cjs   # E2E 场景脚本
 │   └── after-sign.cjs     # adhoc 深签钩子
 └── tests/
-    ├── core.test.mjs      # 纯逻辑单元测试
-    └── fs-ops.test.mjs    # 真实文件系统集成测试
+    ├── core.test.mjs       # 纯逻辑单元测试
+    ├── fs-ops.test.mjs     # 真实文件系统集成测试
+    ├── audit.test.mjs      # 平台配置与孤儿标记审计
+    └── regression.test.mjs # 缺陷回归（每条对应一个修好的 bug）
 ```
 
 ### 架构要点
@@ -349,8 +372,8 @@ codesign -dv release/mac-arm64/光匣.app | grep flags
 ### 自动化测试
 
 ```bash
-npm test         # 56 个单元 + 集成测试
-npm run e2e      # 62 个界面端到端步骤（自动截图到 screenshots/）
+npm test         # 89 个单元 + 集成测试（含 19 项缺陷回归）
+npm run e2e      # 80 个界面端到端步骤（自动截图到 screenshots/）
 ```
 
 E2E 会启动真实 Electron，通过 Chrome DevTools Protocol 派发**真实鼠标与键盘事件**（不是 JS 的 `el.click()`，后者在 React 受控组件上不可靠），逐步验证并在每一步截图。
