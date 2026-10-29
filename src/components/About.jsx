@@ -62,7 +62,7 @@ export function AboutPanel({ settings }) {
         </div>
         <div className="about-meta">
           <h2>{APP_NAME} <span style={{ fontSize: 13, fontWeight: 400, color: 'var(--text-tertiary)' }}>{APP_NAME_EN}</span></h2>
-          <div className="ver">版本 {info?.version || '1.1.0'}{info?.isPackaged ? '' : ' · 开发版'}</div>
+          <div className="ver">版本 {info?.version || '1.2.0'}{info?.isPackaged ? '' : ' · 开发版'}</div>
           <div className="tagline">
             摄影集发布台账 —— 拍完修好的照片，不再忘记发；
             发了小红书，也不会漏掉朋友圈和 B 站。
