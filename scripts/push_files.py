@@ -20,7 +20,6 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 OWNER, REPO = None, None
 BRANCH = 'main'
@@ -70,12 +69,27 @@ def api(method, path, body=None, raw=None, content_type='application/json'):
     return {'__error': -1, 'message': 'retries exhausted'}
 
 
+REMOTE = {}  # path -> (blob_sha, size)，由 load_remote_index() 一次填好
+
+
+def load_remote_index():
+    """一次性取远端文件表。
+
+    不能逐文件 GET /contents/<path>：那会把整个文件的 base64 正文一起返回，
+    本机链路读大响应会抛 IncompleteRead(372003 bytes read, ...)，于是 sha 永远拿不到、
+    PUT 时缺 sha → 422 "sha wasn't supplied"。
+    git/trees 只返回元数据，体积小且一次覆盖全仓。
+    """
+    r = api('GET', f'/repos/{OWNER}/{REPO}/git/trees/{BRANCH}?recursive=1')
+    REMOTE.clear()
+    for x in (r.get('tree') or []):
+        if x.get('type') == 'blob':
+            REMOTE[x['path']] = (x['sha'], x.get('size'))
+    return len(REMOTE)
+
+
 def remote_meta(path):
-    q = urllib.parse.quote(path)
-    r = api('GET', f'/repos/{OWNER}/{REPO}/contents/{q}?ref={BRANCH}')
-    if isinstance(r, dict) and r.get('sha') and r.get('type') == 'file':
-        return r['sha'], r.get('size')
-    return None, None
+    return REMOTE.get(path, (None, None))
 
 
 def push_one(repo_dir, rel):
@@ -105,7 +119,18 @@ def push_one(repo_dir, rel):
     q = urllib.parse.quote(rel)
     r = api('PUT', f'/repos/{OWNER}/{REPO}/contents/{q}', body)
     if isinstance(r, dict) and r.get('__error'):
-        return 'fail', rel, f'{r.get("__error")} {str(r.get("message"))[:120]}'
+        msg = str(r.get('message'))
+        # 索引过期（别人刚改过 / 上一轮部分成功）→ 刷新后重试一次
+        if r.get('__error') in (409, 422):
+            load_remote_index()
+            sha2, _ = remote_meta(rel)
+            retry = dict(body)
+            if sha2:
+                retry['sha'] = sha2
+            r = api('PUT', f'/repos/{OWNER}/{REPO}/contents/{q}', retry)
+            if not (isinstance(r, dict) and r.get('__error')):
+                return 'ok', rel, ''
+        return 'fail', rel, f'{r.get("__error")} {msg[:120]}'
     return 'ok', rel, ''
 
 
@@ -131,24 +156,30 @@ def main():
     total = len(files)
     print(f'待推 {total} 个文件，已完成 {len(done)}', flush=True)
 
+    n = load_remote_index()
+    print(f'远端已有 {n} 个文件', flush=True)
+
     stats = {'ok': 0, 'same': 0, 'skip': 0, 'fail': 0}
     fails = []
     todo = [f for f in files if f not in done]
     stats['skip'] = total - len(todo)
 
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(push_one, repo_dir, rel): rel for rel in todo}
-        for i, fut in enumerate(as_completed(futs), 1):
-            kind, rel, why = fut.result()
-            stats[kind] += 1
-            if kind == 'ok':
-                with open(done_file, 'a') as f:
-                    f.write(rel + '\n')
-            elif kind == 'fail':
-                fails.append((rel, why))
-                print(f'✖ {rel} -> {why}', flush=True)
-            if i % 10 == 0 or i == len(todo):
-                print(f'  进度 {i}/{len(todo)} {stats}', flush=True)
+    # 串行推送：并发时多个请求会带着同一份旧 sha 去 PUT，触发
+    # 409 "is at X but expected Y" / 422 "sha wasn't supplied" 竞态
+    def serial():
+        for rel in todo:
+            yield push_one(repo_dir, rel)
+
+    for i, (kind, rel, why) in enumerate(serial(), 1):
+        stats[kind] += 1
+        if kind == 'ok':
+            with open(done_file, 'a') as f:
+                f.write(rel + '\n')
+        elif kind == 'fail':
+            fails.append((rel, why))
+            print(f'✖ {rel} -> {why}', flush=True)
+        if i % 10 == 0 or i == len(todo):
+            print(f'  进度 {i}/{len(todo)} {stats}', flush=True)
 
     print(f'\n完成：上传 {stats["ok"]}，内容未变 {stats["same"]}，已推跳过 {stats["skip"]}，失败 {stats["fail"]}', flush=True)
     for rel, why in fails[:20]:
