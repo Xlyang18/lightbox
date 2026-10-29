@@ -43,6 +43,13 @@ npm run e2e        # 界面端到端测试（自动截图）
 
 E2E 必须使用 CDP 真实事件（见 `scripts/e2e.cjs` 的 `mouseClick` / `key`），**不要**用 `el.click()` —— 它在 React 受控组件上不会可靠触发更新，会给出假绿。
 
+E2E 会把数据目录隔离到 `~/.lightbox-test/data`（`LIGHTBOX_TEST=1` 时自动生效），不再污染真实配置；改动设置的步骤必须在同一步内还原，否则会污染后续步骤。
+
+### 渲染层常见坑
+
+- **TDZ 白屏**：用 `useRef` 做「最新值容器」时，`xxx.current = {...}` 的赋值若位于被引用变量的 `const` 声明之前，会抛 `Cannot access 'x' before initialization`，整页白屏且主进程日志无任何报错。只会在真实 Electron 里暴露，务必跑 `npm run e2e`。
+- **界面必须跟着磁盘走**：批量改名可能部分失败（冲突跳过）或整批回滚，渲染层只能按返回的 `renamesChanged` 更新，否则会出现「显示已标记、磁盘没改」和「卡片指向已不存在的文件」。
+
 ## 打包
 
 ```bash
