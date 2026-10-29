@@ -3,12 +3,19 @@ import { analyzeCoverage } from '../lib/core.mjs';
 import { Thumb, formatSize, fmtDate } from './Browser.jsx';
 
 const api = window.lightbox;
+const PAGE_SIZE = 120;
 
 export function Checker({ photos, platforms, tree, onJumpToPhoto, onOpenFolder, history, onUndo }) {
   const [tab, setTab] = useState('never');
   const [groupBy, setGroupBy] = useState('folder');
+  // 分组缩略图分批渲染：几千张「从未发布」一次性铺开会让首帧明显卡顿
+  const [shown, setShown] = useState({});
 
   const cov = useMemo(() => analyzeCoverage(photos, platforms), [photos, platforms]);
+  // 已被撤销过的记录不再开放撤销入口（磁盘已还原，点了只会被拒）
+  const undoneIds = useMemo(() => new Set(
+    (history || []).filter((x) => x.type === 'undo' && x.targetId).map((x) => x.targetId)
+  ), [history]);
 
   const groups = (list) => {
     if (groupBy === 'none') return [{ key: '全部', items: list }];
@@ -69,13 +76,13 @@ export function Checker({ photos, platforms, tree, onJumpToPhoto, onOpenFolder, 
         </div>
 
         <div className="tab-row" style={{ padding: 0, borderBottom: 'none', marginBottom: 12 }}>
-          <button className={`tab ${tab === 'never' ? 'on' : ''}`} onClick={() => setTab('never')}>
+          <button className={`tab ${tab === 'never' ? 'on' : ''}`} onClick={() => { setTab('never'); setShown({}); }}>
             从未发布<span className="badge">{cov.never.length}</span>
           </button>
-          <button className={`tab ${tab === 'missing' ? 'on' : ''}`} onClick={() => setTab('missing')}>
+          <button className={`tab ${tab === 'missing' ? 'on' : ''}`} onClick={() => { setTab('missing'); setShown({}); }}>
             平台不全<span className="badge">{cov.missing.length}</span>
           </button>
-          <button className={`tab ${tab === 'complete' ? 'on' : ''}`} onClick={() => setTab('complete')}>
+          <button className={`tab ${tab === 'complete' ? 'on' : ''}`} onClick={() => { setTab('complete'); setShown({}); }}>
             全平台已发<span className="badge">{cov.complete.length}</span>
           </button>
         </div>
@@ -92,7 +99,7 @@ export function Checker({ photos, platforms, tree, onJumpToPhoto, onOpenFolder, 
                 <button className="btn plain sm" style={{ marginLeft: 6 }} onClick={() => onOpenFolder(g.key)}>前往该文件夹</button>
               </div>
               <div className="mini-grid">
-                {g.items.map((p) => (
+                {(g.items.length > PAGE_SIZE ? g.items.slice(0, shown[g.key] || PAGE_SIZE) : g.items).map((p) => (
                   <div className="mini-card" key={p.id} onClick={() => onJumpToPhoto(p)} title={p.name}>
                     <Thumb path={p.path} alt={p.name} className="thumb" />
                     <div className="cap">
@@ -111,6 +118,14 @@ export function Checker({ photos, platforms, tree, onJumpToPhoto, onOpenFolder, 
                   </div>
                 ))}
               </div>
+              {g.items.length > (shown[g.key] || PAGE_SIZE) && (
+                <button
+                  className="btn plain sm show-more"
+                  onClick={() => setShown((s) => ({ ...s, [g.key]: (s[g.key] || PAGE_SIZE) + PAGE_SIZE }))}
+                >
+                  展开更多（还剩 {g.items.length - (shown[g.key] || PAGE_SIZE)} 张）
+                </button>
+              )}
             </div>
           ))
         )}
@@ -139,9 +154,10 @@ export function Checker({ photos, platforms, tree, onJumpToPhoto, onOpenFolder, 
                 {h.type === 'undo' && <div>恢复 {h.renames?.length || 0} 个文件</div>}
                 {h.errors?.length > 0 && <div className="tag warn" style={{ marginTop: 4 }}>⚠︎ {h.errors.length} 条错误</div>}
               </div>
-              {h.type !== 'undo' && (h.renames?.length || 0) > 0 && (
+              {h.type !== 'undo' && (h.renames?.length || 0) > 0 && !undoneIds.has(h.id) && (
                 <button className="btn plain sm" style={{ marginTop: 6 }} onClick={() => onUndo(h.id)}>撤销这次改名</button>
               )}
+              {undoneIds.has(h.id) && <span className="tag" style={{ marginTop: 6 }}>已撤销</span>}
             </div>
           ))
         )}
