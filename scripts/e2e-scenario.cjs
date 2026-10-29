@@ -47,8 +47,14 @@ module.exports = async function scenario(api, ctx) {
   await shot('根目录-全部照片');
 
   await step('展开「2025 秋日街拍」并点击子目录「外滩」', async () => {
+    // 侧栏默认已展开第一层；先收起再展开，确保「展开/收起」交互本身可用
     await mouseClick('.tree-node .caret', { index: 1 });
     await sleep(450);
+    const collapsed = await api.count('.tree-node');
+    await mouseClick('.tree-node .caret', { index: 1 });
+    await sleep(450);
+    const reopened = await api.count('.tree-node');
+    if (reopened <= collapsed) throw new Error(`展开/收起无变化：${collapsed} → ${reopened}`);
     await clickContains('.tree-node', '外滩');
     await sleep(500);
     const n = await api.count(cards);
@@ -137,6 +143,19 @@ module.exports = async function scenario(api, ctx) {
     return `${before} → ${after}`;
   });
   await shot('键盘导航');
+
+  await step('切换目录后（无焦点无选中）按方向键 → 从第一张开始', async () => {
+    // 重新点一次文件夹 = 清空选择与焦点（selectFolder 会重置两者）
+    await clickContains('.tree-node', '外滩');
+    await sleep(600);
+    const before = await api.count('.photo-card.selected');
+    if (before !== 0) throw new Error(`切换目录后应无选中，实际 ${before}`);
+    await key('ArrowRight', { vk: 39, code: 'ArrowRight' });
+    await sleep(500);
+    const idx = await cdp.eval(`[...document.querySelectorAll('.photo-card')].findIndex(n => n.classList.contains('focused'))`);
+    if (idx !== 0) throw new Error(`应从第一张开始，实际焦点在第 ${idx + 1} 张`);
+    return '落在第一张';
+  });
 
   await step('Shift+方向键 → 扩展选择', async () => {
     await key('ArrowRight', { vk: 39, code: 'ArrowRight', modifiers: 8 });
@@ -534,7 +553,10 @@ module.exports = async function scenario(api, ctx) {
     if (!paths[1].includes('待发布')) throw new Error('待发布路径未显示');
     const motion = await api.text('.settings-panel');
     if (!motion.includes('界面动效')) throw new Error('缺少动效开关');
-    return `路径正常 + 动效开关存在`;
+    // 脱敏：界面展示的路径必须折叠主目录，不能出现 /Users/<用户名>
+    if (paths.some((p) => /\/Users\//.test(p))) throw new Error(`路径未脱敏：${paths.join(' | ')}`);
+    if (!paths[0].startsWith('~')) throw new Error(`路径未折叠为 ~：${paths[0]}`);
+    return `路径已脱敏（${paths[0]}）+ 动效开关存在`;
   });
 
   await step('设置：平台管理页（含颜色选择器）', async () => {
@@ -622,7 +644,12 @@ module.exports = async function scenario(api, ctx) {
     await sleep(500);
     const after = await cdp.eval(`document.querySelector('.shortcut-row .shortcut-capture').innerText`);
     if (before === after) throw new Error(`未改变：${before}`);
-    return `${before} → ${after}`;
+    // 还原默认，避免污染后续步骤与下一次运行（曾把「下一张」永久改成 K）
+    await clickText('.settings-panel .btn', '恢复默认快捷键');
+    await sleep(300);
+    const restored = await cdp.eval(`document.querySelector('.shortcut-row .shortcut-capture').innerText`);
+    if (restored !== before) throw new Error(`恢复默认失败：${restored} ≠ ${before}`);
+    return `${before} → ${after} → ${restored}`;
   });
   await shot('设置-快捷键');
 
@@ -772,16 +799,20 @@ module.exports = async function scenario(api, ctx) {
     await mouseClick('[data-testid="settings-save"]');
     await sleep(900);
     const reduced = await cdp.eval(`document.documentElement.classList.contains('reduce-motion')`);
-    // 还原
+    const onLabel = await cdp.eval(`[...document.querySelectorAll('.settings-panel .segmented button')].filter(b=>b.classList.contains('on')).map(b=>b.innerText).join(',')`);
+    // 还原：设置已保存过，弹窗仍在（保存不关闭），直接点「完整动效」再保存
     await clickText('.settings-panel .segmented button', '完整动效');
-    await sleep(200);
+    await sleep(400);
+    const stillOpen = await api.exists('.settings-panel');
+    if (!stillOpen) throw new Error(`保存后弹窗意外关闭（保存前选中=${onLabel}）`);
     await mouseClick('[data-testid="settings-save"]');
     await sleep(900);
     const back = await cdp.eval(`document.documentElement.classList.contains('reduce-motion')`);
     await clickText('.modal-foot .btn', '关闭');
     await sleep(900);
-    if (!reduced) throw new Error('减弱动效未生效');
-    if (back) throw new Error('恢复完整动效失败');
+    const disk = await cdp.eval(`(async()=>{const s=await window.lightbox.settings.get();return String(s.reduceMotion)})()`);
+    if (!reduced) throw new Error(`减弱动效未生效（点击后选中=${onLabel}，磁盘 reduceMotion=${disk}）`);
+    if (back) throw new Error(`恢复完整动效失败（磁盘 reduceMotion=${disk}）`);
     return '减弱 → 恢复 正常';
   });
 
@@ -816,15 +847,18 @@ module.exports = async function scenario(api, ctx) {
     return `工具按钮 ${res.tb.h} / 通用按钮 ${res.btn.h} / 分段 ${res.seg?.h}`;
   });
 
-/* ============ 12. 自定义快捷键生效 ============ */
-  await step('自定义的 K 键（下一张）确实生效', async () => {
+/* ============ 12. 自定义快捷键生效（撤销过快捷键录制，这里验证默认键仍然可用） ============ */
+  await step('快捷键恢复默认后「→」仍能移动焦点', async () => {
     await mouseClick(cards, { index: 0 });
     await sleep(450);
     const before = await api.text(N);
-    await key('k', { vk: 75, code: 'KeyK' });
+    await key('ArrowRight', { vk: 39, code: 'ArrowRight' });
     await sleep(600);
     const after = await api.text(N);
-    if (before === after) throw new Error(`自定义键无效：${before}`);
+    if (before === after) throw new Error(`方向键失效：${before}`);
+    // 键盘移动应同时把选择收敛为单张
+    const sel = await api.count('.photo-card.selected');
+    if (sel !== 1) throw new Error(`应单选 1 张，实际 ${sel}`);
     return `${before} → ${after}`;
   });
   await shot('自定义键生效');
@@ -873,8 +907,113 @@ module.exports = async function scenario(api, ctx) {
   });
   await shot('撤销操作');
 
+  /* ============ 15. 本轮新增能力核验 ============ */
+  await step('预览翻页限定在当前目录内（不会翻到别的文件夹）', async () => {
+    // 此时在漏发检查视图，先回浏览并确保目标文件夹的节点已展开可见
+    await mouseClick('[data-testid="tab-browse"]');
+    await sleep(700);
+    if (!(await api.exists('.tree-node'))) throw new Error('浏览视图未恢复');
+    const hasNode = await cdp.eval(`(() => {
+      const el = [...document.querySelectorAll('.tree-node')].find(n => n.innerText.includes('外滩'));
+      if (el) return true;
+      const caret = document.querySelectorAll('.tree-node .caret')[1];
+      if (caret) caret.click();
+      return false;
+    })()`);
+    if (!hasNode) { await sleep(500); }
+    await clickContains('.tree-node', '外滩');
+    await sleep(600);
+    const total = await api.count(cards);
+    await mouseClick(cards, { index: 0 });
+    await sleep(300);
+    await key(' ', { vk: 32, code: 'Space' });
+    await sleep(1200);
+    const counter = await api.text('.lightbox-bar');
+    const m = counter.match(/(\d+)\s*\/\s*(\d+)/);
+    if (!m) throw new Error(`预览计数缺失：${counter.slice(0, 80)}`);
+    if (Number(m[2]) !== total) throw new Error(`预览序列应为当前目录 ${total} 张，实际 ${m[2]}`);
+    await key('Escape', { vk: 27, code: 'Escape' });
+    await sleep(500);
+    return `外滩 ${total} 张 → 预览序列 ${m[2]} 张`;
+  });
+
+  await step('预览内空格缩放生效', async () => {
+    await mouseClick(cards, { index: 0 });
+    await sleep(300);
+    await key(' ', { vk: 32, code: 'Space' });
+    await sleep(1000);
+    const s1 = await cdp.eval(`getComputedStyle(document.querySelector('.lightbox-stage img')).transform`);
+    await key(' ', { vk: 32, code: 'Space' });
+    await sleep(500);
+    const s2 = await cdp.eval(`getComputedStyle(document.querySelector('.lightbox-stage img')).transform`);
+    await key('Escape', { vk: 27, code: 'Escape' });
+    await sleep(500);
+    if (s1 === s2) throw new Error(`缩放未变化：${s1}`);
+    return `${s1} → ${s2}`;
+  });
+
+  await step('拖框拖动中实时高亮，松手前不改选择', async () => {
+    await key('Escape', { vk: 27, code: 'Escape' });
+    await sleep(300);
+    await api.drag(cards, cards);
+    await sleep(300);
+    const sel = await api.count('.photo-card.selected');
+    const hits = await api.count('.photo-card.marquee-hit');
+    if (sel < 1) throw new Error('框选后没有选中');
+    if (hits !== 0) throw new Error(`松手后仍残留高亮 ${hits} 个`);
+    return `${sel} 张已选中，临时高亮已清理`;
+  });
+
+  await step('设置：平台行可删除并至少保留一个', async () => {
+    await mouseClick('[data-testid="btn-settings"]');
+    await sleep(700);
+    await clickText('.settings-nav button', '平台');
+    await sleep(400);
+    const before = await api.count('.platform-row');
+    await mouseClick('.platform-row .row-del', { index: before - 1 });
+    await sleep(400);
+    const after = await api.count('.platform-row');
+    if (after !== before - 1) throw new Error(`删除无效：${before} → ${after}`);
+    // 不保存，直接关闭丢弃草稿
+    await clickText('.modal-foot .btn', '关闭');
+    await sleep(900);
+    await mouseClick('[data-testid="btn-settings"]');
+    await sleep(700);
+    await clickText('.settings-nav button', '平台');
+    await sleep(400);
+    const restored = await api.count('.platform-row');
+    if (restored !== before) throw new Error(`未保存的删除却生效了：${restored}`);
+    await clickText('.modal-foot .btn', '关闭');
+    await sleep(900);
+    return `${before} → ${after}（未保存还原为 ${restored}）`;
+  });
+
+  await step('关于页与更新日志页内容完整且可读', async () => {
+    await mouseClick('[data-testid="btn-settings"]');
+    await sleep(700);
+    await clickText('.settings-nav button', '关于');
+    await sleep(500);
+    const about = await api.text('[data-testid="about-panel"]');
+    for (const kw of ['光匣', '版本', '功能一览', '运行环境', '永不删除']) {
+      if (!about.includes(kw)) throw new Error(`关于页缺少「${kw}」`);
+    }
+    await clickText('.settings-nav button', '更新日志');
+    await sleep(500);
+    const cl = await api.text('[data-testid="changelog-panel"]');
+    const latest = await api.text('.changelog-entry.latest .cl-ver');
+    if (!latest.includes('1.2.0')) throw new Error(`最新版本应为 v1.2.0，实际 ${latest}`);
+    const emoji = (cl.match(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu) || []).length;
+    if (emoji < 20) throw new Error(`更新日志 emoji 过少：${emoji}`);
+    await clickText('.modal-foot .btn', '关闭');
+    await sleep(900);
+    return `关于页关键词齐全 · 最新 ${latest} · ${emoji} 个 emoji`;
+  });
+
   await step('撤销后返回浏览视图，数据完好', async () => {
     await mouseClick('[data-testid="tab-browse"]');
+    await sleep(800);
+    // 当前停在「外滩」，切到「全部」核对总张数
+    await clickText('.pane-head .tb-btn', '全部');
     await sleep(800);
     const n = await api.count(cards);
     if (n < 24) throw new Error(`照片数量异常：${n}`);
