@@ -19,14 +19,25 @@ function applyTheme(s) {
 }
 
 /* 目录树节点与照片列表对齐（供 folder 级统计使用）——模块级，避免闭包引用问题 */
-function hydrateTree(node, photos) {
+function hydrateTree(node, photos, byDir) {
   if (!node) return node;
-  const files = photos.filter((p) => p.relDir === node.relPath);
+  const map = byDir || groupByDir(photos);
   return {
     ...node,
-    files,
-    children: (node.children || []).map((c) => hydrateTree(c, photos))
+    files: map.get(node.relPath) || [],
+    children: (node.children || []).map((c) => hydrateTree(c, photos, map))
   };
+}
+
+/** relDir -> 照片数组（一次遍历，避免每个节点都过滤全量） */
+function groupByDir(photos) {
+  const map = new Map();
+  for (const p of photos || []) {
+    const k = p.relDir || '';
+    if (!map.has(k)) map.set(k, []);
+    map.get(k).push(p);
+  }
+  return map;
 }
 
 export default function App() {
@@ -43,7 +54,12 @@ export default function App() {
   const [lightboxId, setLightboxId] = useState(null);
   const [batchOpen, setBatchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState('general'); // 菜单可直达「关于 / 更新日志」
   const [history, setHistory] = useState([]);
+  const [homeDir, setHomeDir] = useState(''); // 仅用于界面显示时折叠路径，不落盘
+  /** 键盘 / 菜单处理器用 ref 读取最新状态（声明必须位于任何赋值之前） */
+  const kbLive = useRef({});
+  const menuLive = useRef({});
   const [toasts, setToasts] = useState([]);
   const [error, setError] = useState(null);
 
@@ -72,27 +88,35 @@ export default function App() {
         setLoading(false);
       }
       try { setHistory(await A.history.list()); } catch { /* ignore */ }
+      try {
+        const info = await A.app.info();
+        if (info?.homeDir) setHomeDir(info.homeDir);
+      } catch { /* 仅影响路径展示，失败可忽略 */ }
     })();
   }, []);
 
-  const loadCollection = useCallback(async (root, rel = '') => {
+  /** rel 可以是 '' | '__all__' | '子/目录'；keepSelection=true 时保留选择与焦点（静默刷新用） */
+  const loadCollection = useCallback(async (root, rel = '', opts = {}) => {
     if (!root) return null;
-    setLoading(true);
+    const { silent = false, force = false, keepSelection = false } = opts;
+    if (!silent) setLoading(true);
     setError(null);
     try {
-      const data = await A.scan.folder(root);
+      const data = await A.scan.folder(root, { force });
       const photos = (data.photos || []).map((p, i) => ({ ...p, id: p.path || `p${i}` }));
       const tree = hydrateTree(data.tree, photos);
       setCollection({ ...data, tree, photos });
       setCurrentRel(rel || '');
-      setSelection(new Set());
-      setFocusedId(null);
+      if (!keepSelection) {
+        setSelection(new Set());
+        setFocusedId(null);
+      }
       return { ...data, tree, photos };
     } catch (e) {
       setError(e.message.replace(/^Error: /, ''));
       return null;
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
@@ -113,6 +137,17 @@ export default function App() {
     }
     return list;
   }, [collection, currentRel, query]);
+
+  /**
+   * 预览序列：起点在当前视图里就用视图（与网格同序），
+   * 否则退回全集（例如从漏发检查跳进来时视图还没切过去）。
+   */
+  const currentList = useMemo(() => {
+    if (!collection) return [];
+    if (lightboxId && viewPhotos.some((p) => p.id === lightboxId)) return viewPhotos;
+    if (lightboxId) return collection.photos;
+    return viewPhotos;
+  }, [collection, viewPhotos, lightboxId]);
 
 
   const selectedPhotos = useMemo(
@@ -147,12 +182,12 @@ export default function App() {
     toast(`已加入发布包（${photos.length} 张）`, 'success');
   };
 
+
   /* ---------- 标记切换 ---------- */
   const togglePlatform = useCallback(async (photos, platformId) => {
     if (!photos.length || !settings) return;
     // 逻辑：当前选中集合内的文件，若全都已含该平台 -> 全部取消；否则全部加上
     const allHave = photos.every((p) => p.platforms.includes(platformId));
-    const paths = new Set(photos.map((p) => p.path));
     // 需要重新计算：对每个文件的最终平台集合
     const items = photos.map((p) => {
       const nextIds = allHave
@@ -177,20 +212,23 @@ export default function App() {
         toast(`${allHave ? '取消' : '标记'}「${pf?.name}」· ${photos.length} 张`, 'success');
       }
 
-      const paths = new Set(photos.map((p) => p.path));
+      // 只认「磁盘上真的改成功」的那些：跳过/报错的文件保持原状，
+      // 否则界面会显示成已标记，而磁盘上并没有改（下一次打包才会露馅）。
+      const failedPaths = new Set([...(res.skipped || []), ...(res.errors || [])].map((x) => x.from));
+      const donePaths = new Set((res.done || []).map((x) => x.from));
+      const paths = new Set([...donePaths]);
       // 先把结果算出来，再用同一份数据更新界面（避免 updater 内外数据不一致）
       const emojiOf = (ids) => settings.platforms.filter((p) => ids.includes(p.id)).map((p) => p.emoji).join('');
       const pathMap = new Map();
       const nameOf = new Map();
-      const idMap = new Map();
       const targetOf = new Map();
-      for (const it of items) {
+      const okItems = items.filter((it) => !failedPaths.has(it.path));
+      for (const it of okItems) {
         const { base, ext } = parseName(it.name, settings.platforms);
         const nextName = `${base}${emojiOf(it.nextIds)}${ext ? `.${ext}` : ''}`;
         const nextPath = `${path.dirname(it.path)}/${nextName}`;
         nameOf.set(it.path, nextName);
         pathMap.set(it.path, nextPath);
-        idMap.set(it.path, nextPath);
         targetOf.set(it.path, it.nextIds);
       }
 
@@ -227,6 +265,41 @@ export default function App() {
     }
   }, [settings, toast]);
 
+  // 延迟绑定完成（此处 togglePlatform 已初始化，避免 TDZ 白屏）
+  kbLive.current = {
+    settings, viewPhotos, focusedId, selectedPhotos, resolvedFocus, batchOpen, settingsOpen,
+    lightboxId, query, togglePlatform, addToBatch
+  };
+
+  /**
+   * 把 rename 结果映射到渲染层状态。
+   * res.renamesChanged 只包含磁盘上真的改了名的条目 —— 界面跟着它走，
+   * 才不会出现「显示已改名、实际没改」或「改名失败后卡片指向不存在的文件」。
+   */
+  const applyRenameResult = (res) => {
+    const changes = res?.renamesChanged || [];
+    if (!changes.length) return;
+    const map = new Map(changes.map((c) => [c.from, c.to]));
+    const nextPathOf = (p) => map.get(p) || p;
+    setCollection((c) => {
+      if (!c) return c;
+      const photos2 = c.photos.map((p) => {
+        const np = map.get(p.path);
+        if (!np) return p;
+        return { ...p, id: np, path: np, name: path.basename(np) };
+      });
+      return { ...c, photos: photos2, tree: hydrateTree(c.tree, photos2) };
+    });
+    setSelection((prev) => {
+      const next = new Set();
+      for (const id of prev) next.add(nextPathOf(id));
+      return next;
+    });
+    setFocusedId((prev) => (prev ? nextPathOf(prev) : prev));
+    setLightboxId((prev) => (prev ? nextPathOf(prev) : prev));
+    setBatchItems((prev) => prev.map(nextPathOf));
+  };
+
   /* ---------- 打包执行 ---------- */
   const executeBatch = async (payload) => {
     try {
@@ -236,13 +309,14 @@ export default function App() {
       } else {
         toast(`已打包 ${res.folders.length} 个文件夹 · ${res.copies.length} 份副本 · 改名 ${res.renames.length} 个`, 'success');
       }
-      // 刷新集合（文件名变了）
-      await loadCollection(collection.root, currentRel === '__all__' ? '' : currentRel);
+      // 以磁盘真实结果为准更新内存：成功改名的换到新路径；被跳过/回滚的保持原样。
+      // 这一步先做，即便随后的重扫失败，界面也不会指向已不存在的文件。
+      applyRenameResult(res);
+      // 刷新集合（文件名变了）：强制重扫并保留选择，避免视口跳到顶部
+      await loadCollection(collection.root, currentRel === '__all__' ? '' : currentRel,
+        { silent: true, force: true, keepSelection: true });
       setBatchItems([]);
       setHistory(await A.history.list());
-      if (res.folders[0]) {
-        /* 打包后可打开目录，交由用户决定 */
-      }
       return res;
     } catch (e) {
       toast(e.message.replace(/^Error: /, ''), 'error');
@@ -253,8 +327,14 @@ export default function App() {
   const undoHistory = async (id) => {
     try {
       const res = await A.history.undo(id);
-      toast(`已撤销 ${res.done.length} 个改名`, 'success');
-      await loadCollection(collection.root, currentRel === '__all__' ? '' : currentRel);
+      const failed = (res.errors || []).length;
+      toast(failed
+        ? `已撤销 ${res.done.length} 个改名，${failed} 个未能回滚（原文件名被占用或文件已移动）`
+        : `已撤销 ${res.done.length} 个改名`, failed ? 'error' : 'success');
+      // 撤销成功后同样按磁盘结果同步界面（撤销 = 由新名改回旧名）
+      applyRenameResult({ renamesChanged: (res.done || []).map((d) => ({ from: d.to, to: d.from })) });
+      await loadCollection(collection.root, currentRel === '__all__' ? '' : currentRel,
+        { silent: true, force: true, keepSelection: true });
       setHistory(await A.history.list());
     } catch (e) {
       toast(e.message.replace(/^Error: /, ''), 'error');
@@ -262,19 +342,37 @@ export default function App() {
   };
 
   /* ---------- 键盘 ---------- */
-  const sc = settings?.shortcuts || {};
+
+  /**
+   * 键盘处理器：用 ref 拿到最新状态，这样监听器只挂一次，不会每次选片都重建。
+   * kbLive.current 的赋值放在 togglePlatform 定义之后（避免 TDZ）。
+   */
 
   useEffect(() => {
-    if (!settings || batchOpen || settingsOpen || lightboxId) return;
     const onKey = (e) => {
+      const S = kbLive.current;
+      if (!S.settings || S.batchOpen || S.settingsOpen || S.lightboxId) return;
       const tag = (e.target?.tagName || '').toLowerCase();
       if (tag === 'input' || tag === 'textarea') return;
+      const settings = S.settings;
+      const viewPhotos = S.viewPhotos || [];
+      const focusedId = S.focusedId;
+      const selectedPhotos = S.selectedPhotos || [];
+      const resolvedFocus = S.resolvedFocus;
+      const togglePlatform = S.togglePlatform;
+      const addToBatch = S.addToBatch;
+      const sc = settings.shortcuts || {};
 
-      const idx = viewPhotos.findIndex((p) => p.id === focusedId);
+      // 起点：优先焦点，其次唯一选中项（鼠标点选后即使焦点未同步也能继续用方向键）
+      let idx = viewPhotos.findIndex((p) => p.id === focusedId);
+      if (idx < 0 && selectedPhotos.length === 1) idx = viewPhotos.findIndex((p) => p.id === selectedPhotos[0].id);
       const move = (delta, extendSelection) => {
         if (viewPhotos.length === 0) return;
-        const baseIdx = idx < 0 ? 0 : idx;
-        const nextIdx = Math.max(0, Math.min(viewPhotos.length - 1, baseIdx + delta));
+        // 完全无起点时（既没焦点也没单选），第一次按方向键直接落到第一张，
+        // 而不是「第一张 + delta」跳到第二张
+        const nextIdx = idx < 0
+          ? 0
+          : Math.max(0, Math.min(viewPhotos.length - 1, idx + delta));
         const target = viewPhotos[nextIdx];
         setFocusedId(target.id);
         if (extendSelection) {
@@ -312,6 +410,8 @@ export default function App() {
       }
       if (matchShortcut(sc.clearSelection, e)) {
         e.preventDefault();
+        // Esc 分层：有搜索结果时先退出搜索，再按一次才清空选择
+        if (S.query) { setQuery(''); return; }
         setSelection(new Set());
         return;
       }
@@ -321,47 +421,54 @@ export default function App() {
         return;
       }
       // 平台快捷键（可在设置里改，但默认数字键）
+      const active = settings.platforms.filter((p) => p.enabled !== false);
       const pfKeys = [
-        ['togglePlatform1', settings.platforms.filter((p) => p.enabled !== false)[0]?.id],
-        ['togglePlatform2', settings.platforms.filter((p) => p.enabled !== false)[1]?.id],
-        ['togglePlatform3', settings.platforms.filter((p) => p.enabled !== false)[2]?.id]
+        ['togglePlatform1', active[0]?.id],
+        ['togglePlatform2', active[1]?.id],
+        ['togglePlatform3', active[2]?.id]
       ];
+      // 数字键兜底：平台自带的 shortcut（与快捷键设置在未同步时仍可用）
+      const direct = settings.platforms.find((p) => p.enabled !== false
+        && String(p.shortcut) === e.key && !e.metaKey && !e.ctrlKey && !e.altKey);
+      const targets = selectedPhotos.length ? selectedPhotos : (resolvedFocus ? [resolvedFocus] : []);
+      // 先命中「快捷键设置」，再兜底「平台自带键」；只执行第一个命中项，
+      // 避免快捷键冲突（例如把小红的键改成 2）导致一次按键给同一平台打两次标。
+      let hitPid = null;
       for (const [key, pid] of pfKeys) {
-        if (pid && matchShortcut(sc[key], e)) {
-          e.preventDefault();
-          const targets = selectedPhotos.length ? selectedPhotos : (resolvedFocus ? [resolvedFocus] : []);
-          if (targets.length) togglePlatform(targets, pid);
-          return;
-        }
+        if (pid && matchShortcut(sc[key], e)) { hitPid = pid; break; }
       }
-      // 平台自带数字键（与快捷键设置可能不同步时兜底）
-      const direct = settings.platforms.find((p) => p.enabled !== false && p.shortcut === e.key && !e.metaKey && !e.ctrlKey && !e.altKey);
-      if (direct) {
+      if (!hitPid && direct) hitPid = direct.id;
+      if (hitPid) {
         e.preventDefault();
-        const targets = selectedPhotos.length ? selectedPhotos : (resolvedFocus ? [resolvedFocus] : []);
-        if (targets.length) togglePlatform(targets, direct.id);
+        if (targets.length) togglePlatform(targets, hitPid);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [settings, viewPhotos, focusedId, selectedPhotos, resolvedFocus, batchOpen, settingsOpen, lightboxId, togglePlatform, sc]);
+  }, []);
 
-  /* 菜单事件 */
+  /* 菜单事件：用 ref 读取最新上下文，监听只挂一次 */
+  // 注意：switchView / openCollection 定义在本 effect 之后，不能在此处求值（会造成 TDZ 白屏）。
+  // 它们的引用在各自定义处写入；这里只放已就绪的值。
+  menuLive.current = { ...menuLive.current, collection, currentRel, loadCollection, toast };
   useEffect(() => {
-    if (!A.menu?.onAction) return;
+    if (!A.menu?.onAction) return undefined;
     return A.menu.onAction((action) => {
-      if (action === 'open-settings') setSettingsOpen(true);
-      else if (action === 'open-checker') switchView('checker');
-      else if (action === 'open-collection') openCollection();
+      const M = menuLive.current;
+      if (action === 'open-settings') { setSettingsTab('general'); setSettingsOpen(true); }
+      else if (action === 'open-about') { setSettingsTab('about'); setSettingsOpen(true); }
+      else if (action === 'open-changelog') { setSettingsTab('changelog'); setSettingsOpen(true); }
+      else if (action === 'open-checker') M.switchView('checker');
+      else if (action === 'open-collection') M.openCollection?.();
       else if (action === 'refresh-collection') {
-        if (collection?.root) {
-          loadCollection(collection.root, currentRel === '__all__' ? '' : currentRel);
-          toast('已重新扫描摄影集', 'success');
+        if (M.collection?.root) {
+          M.loadCollection(M.collection.root, M.currentRel === '__all__' ? '' : M.currentRel, { force: true });
+          M.toast('已重新扫描摄影集', 'success');
         }
       } else if (action === 'toggle-sidebar') setSidebarOpen((v) => !v);
       else if (action === 'toggle-inspector') setInspectorOpen((v) => !v);
     });
-  }, [collection?.root, currentRel]);
+  }, []);
 
   /* ---------- 动作 ---------- */
   const openCollection = async () => {
@@ -369,32 +476,36 @@ export default function App() {
     if (!root) return;
     const s = await A.settings.set({ photoRoot: root, lastFolder: '' });
     setSettings(s);
-    await loadCollection(root, '');
+    await loadCollection(root, '', { force: true });
   };
+  // 供菜单事件调用（避免菜单闭包拿到旧函数）
+  menuLive.current.openCollection = openCollection;
 
   /** 切换主视图，并记住偏好（只 patch 单字段，绝不用旧快照整块写回） */
   const switchView = useCallback((next) => {
     setView(next);
-    A.settings.set({ lastView: next });
+    A.settings.set({ lastView: next }).catch(() => {});
   }, []);
+  menuLive.current.switchView = switchView;
 
   /** 面板显隐一并持久化，下次启动恢复原样 */
   const toggleSidebar = () => {
     setSidebarOpen((v) => {
       const next = !v;
-      A.settings.set({ sidebarOpen: next });
+      A.settings.set({ sidebarOpen: next }).catch(() => {});
       return next;
     });
   };
   const toggleInspector = () => {
     setInspectorOpen((v) => {
       const next = !v;
-      A.settings.set({ inspectorOpen: next });
+      A.settings.set({ inspectorOpen: next }).catch(() => {});
       return next;
     });
   };
 
   const saveSettings = async (draft) => {
+    // 以磁盘上的最新配置为基线合并草稿，防止弹窗打开期间外部改动（列数、面板开关）被冲掉
     const s = await A.settings.set(draft);
     setSettings(s);
     setInspectorOpen(s.inspectorOpen !== false);
@@ -411,12 +522,16 @@ export default function App() {
     toast('设置已保存', 'success');
   };
 
-  const selectFolder = (rel) => {
+  /**
+   * 切目录只改前端视图（数据已在内存里），不再触发整盘重扫。
+   * 持久化走串行队列，避免和「列数 / 面板开关」等写入互相覆盖。
+   */
+  const selectFolder = useCallback((rel) => {
     setCurrentRel(rel);
     setSelection(new Set());
     setFocusedId(null);
-    if (settings) A.settings.set({ lastFolder: rel });
-  };
+    A.settings.set({ lastFolder: rel }).catch(() => {});
+  }, []);
 
   const jumpToPhoto = (photo) => {
     setQuery('');
@@ -478,7 +593,7 @@ export default function App() {
           title="显示/隐藏检查器（⌘⌥I）"
           data-testid="btn-toggle-inspector"
         >◫</button>
-        <button className="tb-btn" onClick={() => setSettingsOpen(true)} data-testid="btn-settings" title="设置（⌘,）">⚙︎</button>
+        <button className="tb-btn" onClick={() => { setSettingsTab('general'); setSettingsOpen(true); }} data-testid="btn-settings" title="设置（⌘,）">⚙︎</button>
       </header>
 
       <div className="body-row">
@@ -548,7 +663,7 @@ export default function App() {
               </p>
               <div style={{ display: 'flex', gap: 10 }}>
                 <button className="btn primary" onClick={openCollection} data-testid="empty-open">选择摄影集目录</button>
-                <button className="btn plain" onClick={() => setSettingsOpen(true)}>先设置待发布目录</button>
+                <button className="btn plain" onClick={() => { setSettingsTab('general'); setSettingsOpen(true); }}>先设置待发布目录</button>
               </div>
             </div>
           </div>
@@ -621,11 +736,13 @@ export default function App() {
         </footer>
       )}
 
-      {lightboxId && (
+      {lightboxId && collection && (
         <Lightbox
+          list={currentList}
           photos={collection.photos}
           startId={lightboxId}
           platforms={platforms}
+          shortcuts={settings?.shortcuts}
           onClose={() => setLightboxId(null)}
           onTogglePlatform={(ph, pid) => togglePlatform(ph, pid)}
         />
@@ -643,11 +760,14 @@ export default function App() {
 
       {settingsOpen && (
         <Settings
+          key={`settings-${settingsTab}`}
           settings={settings}
           history={history}
           onUndo={undoHistory}
           onSave={saveSettings}
-          onClose={() => setSettingsOpen(false)}
+          initialTab={settingsTab}
+          homeDir={homeDir}
+          onClose={() => { setSettingsOpen(false); setSettingsTab('general'); }}
         />
       )}
 
