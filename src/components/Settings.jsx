@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  isValidShortcut, DEFAULT_PLATFORMS, PLATFORM_COLORS,
+  isValidShortcut, DEFAULT_PLATFORMS, PLATFORM_COLORS, DEFAULT_SHORTCUTS,
   validatePlatforms, hasFatalPlatformIssue, makeNewPlatform
 } from '../lib/core.mjs';
 import { AboutPanel, ChangelogPanel } from './About.jsx';
@@ -74,6 +74,16 @@ function ShortcutCapture({ value, onChange }) {
 }
 
 /** 深拷贝草稿：草稿绝不能与外部 settings 共享 platforms / shortcuts 等嵌套引用 */
+/**
+ * 路径展示：把主目录折叠成 ~ —— macOS 主目录名通常就是用户名，
+ * 截图、录屏、Issue 贴图时不该把这个散出去。
+ */
+function prettyPath(p, home) {
+  if (!p) return '';
+  if (home && p.startsWith(home)) return `~${p.slice(home.length)}`;
+  return p;
+}
+
 function cloneSettings(s) {
   if (!s) return s;
   return {
@@ -83,7 +93,7 @@ function cloneSettings(s) {
   };
 }
 
-export function Settings({ settings, onSave, onClose, history, onUndo, initialTab = 'general' }) {
+export function Settings({ settings, onSave, onClose, history, onUndo, initialTab = 'general', homeDir = '' }) {
   const [tab, setTab] = useState(initialTab);
   const [draft, setDraft] = useState(() => cloneSettings(settings));
   const [saved, setSaved] = useState(false);
@@ -115,6 +125,19 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
   const platforms = draft.platforms || DEFAULT_PLATFORMS;
   const issues = useMemo(() => validatePlatforms(platforms), [platforms]);
   const fatal = hasFatalPlatformIssue(issues);
+  // 快捷键冲突：同一个组合绑给两个动作时，运行时只有先命中的那个会生效
+  const shortcutIssues = useMemo(() => {
+    const seen = new Map();
+    const out = [];
+    for (const [k] of Object.entries(SHORTCUT_LABELS)) {
+      const v = String(draft.shortcuts?.[k] || '').trim();
+      if (!v) continue;
+      if (!isValidShortcut(v)) { out.push({ key: k, msg: `${SHORTCUT_LABELS[k]} 的按键「${v}」无效` }); continue; }
+      if (seen.has(v)) out.push({ key: k, msg: `「${SHORTCUT_LABELS[k]}」与「${SHORTCUT_LABELS[seen.get(v)]}」都绑定了 ${v}` });
+      else seen.set(v, k);
+    }
+    return out;
+  }, [draft.shortcuts]);
 
   const save = async () => {
     if (fatal) {
@@ -127,6 +150,11 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
     const dupKeys = issues.filter((i) => i.kind === 'shortcut');
     if (dupKeys.length) {
       setSaveError(`提示：${dupKeys[0].msg}，请到「平台」页检查`);
+    }
+    if (shortcutIssues.length) {
+      setSaveError(`无法保存：${shortcutIssues[0].msg}（请到「快捷键」页修正）`);
+      setTab('shortcuts');
+      return;
     }
     setBusy(true);
     setSaveError(null);
@@ -153,6 +181,11 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
       setSaveError(String(e.message || e));
     }
   };
+
+  // 已被撤销过的记录：不再提供「撤销」按钮，改为标记（避免用户点了才被拒绝）
+  const undoneIds = useMemo(() => new Set(
+    (history || []).filter((x) => x.type === 'undo' && x.targetId).map((x) => x.targetId)
+  ), [history]);
 
   const setPlatformField = (i, patch) => {
     update({ platforms: platforms.map((x, j) => (j === i ? { ...x, ...patch } : x)) });
@@ -195,7 +228,7 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
                 <label className="field-label">摄影集根目录</label>
                 <div className="path-row">
                   <div className={`path-display ${draft.photoRoot ? 'set' : ''}`} title={draft.photoRoot}>
-                    {draft.photoRoot || '未选择'}
+                    {draft.photoRoot ? prettyPath(draft.photoRoot, homeDir) : '未选择'}
                   </div>
                   <button className="btn plain" onClick={choosePhoto}>选择…</button>
                 </div>
@@ -205,7 +238,7 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
                 <label className="field-label">待发布目录（打包目标）</label>
                 <div className="path-row">
                   <div className={`path-display ${draft.publishRoot ? 'set' : ''}`} title={draft.publishRoot}>
-                    {draft.publishRoot || '未选择'}
+                    {draft.publishRoot ? prettyPath(draft.publishRoot, homeDir) : '未选择'}
                   </div>
                   <button className="btn plain" onClick={choosePublish}>选择…</button>
                 </div>
@@ -239,15 +272,19 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
               <div className="field">
                 <label className="field-label">界面动效</label>
                 <div className="segmented">
-                  {[[true, '完整动效'], [false, '减弱动效']].map(([v, label]) => (
-                    <button
-                      key={String(v)}
-                      className={(draft.reduceMotion !== false) === !v ? 'on' : ''}
-                      onClick={() => update({ reduceMotion: !v })}
-                    >
-                      {label}
-                    </button>
-                  ))}
+                  {/* 单一真源：reduceMotion=true 表示「减弱动效」；未设置时按完整动效处理 */}
+                  {[[false, '完整动效'], [true, '减弱动效']].map(([reduce, label]) => {
+                    const current = draft.reduceMotion === true;
+                    return (
+                      <button
+                        key={String(reduce)}
+                        className={current === reduce ? 'on' : ''}
+                        onClick={() => update({ reduceMotion: reduce })}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 6, lineHeight: 1.6 }}>
                   减弱动效会关掉过渡与入场动画，适合喜欢瞬时反应或使用录屏的场景。
@@ -285,8 +322,8 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
                       className="p-emoji"
                       value={p.emoji}
                       maxLength={4}
-                      title="标记 emoji"
-                      onChange={(e) => setPlatformField(i, { emoji: e.target.value })}
+                      title="标记 emoji（建议用 ⌃⌘空格 打开表情面板）"
+                      onChange={(e) => setPlatformField(i, { emoji: e.target.value.trim() })}
                     />
                     <input
                       className="p-name"
@@ -295,7 +332,7 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
                       onChange={(e) => setPlatformField(i, { name: e.target.value })}
                     />
                     <div className="color-swatches">
-                      {PLATFORM_COLORS.slice(0, 6).map((c) => (
+                      {PLATFORM_COLORS.map((c) => (
                         <button
                           key={c}
                           className={`swatch ${p.color === c ? 'on' : ''}`}
@@ -316,8 +353,14 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
                     <button
                       className={`switch ${p.enabled !== false ? 'on' : ''}`}
                       onClick={() => setPlatformField(i, { enabled: p.enabled === false })}
-                      title={p.enabled !== false ? '已启用' : '已停用'}
+                      title={p.enabled !== false ? '已启用（点击停用）' : '已停用（点击启用）'}
                     />
+                    <button
+                      className="icon-btn row-del"
+                      title={platforms.length <= 1 ? '至少保留一个平台' : '删除该平台（老文件上的标记仍会被识别）'}
+                      disabled={platforms.length <= 1}
+                      onClick={() => update({ platforms: platforms.filter((_, j) => j !== i) })}
+                    >✕</button>
                   </div>
                 );
               })}
@@ -354,10 +397,15 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
                   />
                 </div>
               ))}
+              {shortcutIssues.length > 0 && (
+                <div className="field-error" style={{ marginTop: 8 }}>
+                  ⚠︎ {shortcutIssues.map((x) => x.msg).join('；')}
+                </div>
+              )}
               <button
                 className="btn plain"
                 style={{ marginTop: 14 }}
-                onClick={() => update({ shortcuts: { ...settings.shortcuts } })}
+                onClick={() => update({ shortcuts: { ...DEFAULT_SHORTCUTS } })}
               >
                 恢复默认快捷键
               </button>
@@ -385,10 +433,13 @@ export function Settings({ settings, onSave, onClose, history, onUndo, initialTa
                     改名 {h.renames?.length || 0} 个 · 复制 {h.copies?.length || 0} 份
                     {h.errors?.length > 0 && <span className="tag warn" style={{ marginLeft: 6 }}>⚠︎ {h.errors.length} 条错误</span>}
                   </div>
-                  {h.type !== 'undo' && (h.renames?.length || 0) > 0 && onUndo && (
+                  {h.type !== 'undo' && (h.renames?.length || 0) > 0 && onUndo && !undoneIds.has(h.id) && (
                     <button className="btn plain sm" style={{ marginTop: 6 }} onClick={() => onUndo(h.id)}>
                       撤销这次改名
                     </button>
+                  )}
+                  {undoneIds.has(h.id) && (
+                    <span className="tag" style={{ marginTop: 6 }}>已撤销</span>
                   )}
                 </div>
               ))}
