@@ -1,7 +1,7 @@
 {
   "name": "lightbox-photo-batch",
   "productName": "光匣",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "光匣 Lightbox — macOS 摄影集发布台账：多级文件夹预览选片、平台标记、批次打包归档、漏发检查",
   "author": "Xlyang",
   "license": "MIT",
