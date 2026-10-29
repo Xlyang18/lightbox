@@ -129,11 +129,17 @@ export function dedupe(list) {
   return out;
 }
 
+/** emoji 归一：去掉变体选择符 FE0F 与零宽连接符后的可比形态 */
+export function normalizeEmoji(s) {
+  return String(s || '').replace(/[\uFE0F\u200D]/g, '');
+}
+
 /** 由平台 emoji 数组求平台 id 数组（有序、去重） */
 export function marksToPlatformIds(marks, platforms = DEFAULT_PLATFORMS) {
   const ids = [];
   for (const m of marks) {
-    const p = platforms.find((x) => x.emoji === m);
+    const key = normalizeEmoji(m);
+    const p = platforms.find((x) => normalizeEmoji(x.emoji) === key);
     if (p && !ids.includes(p.id)) ids.push(p.id);
   }
   return ids;
@@ -153,14 +159,17 @@ export function computeRename(fileName, targetPlatformIds, platforms = DEFAULT_P
   const currentIds = marksToPlatformIds(parsed.marks, platforms);
   const nextMarks = platformIdsToMarks(targetPlatformIds, platforms);
   const nextName = buildName(parsed.base, nextMarks, parsed.ext);
+  const nextIds = dedupe(targetPlatformIds).filter((id) => platforms.some((p) => p.id === id));
   return {
     from: fileName,
     to: nextName,
     base: parsed.base,
     ext: parsed.ext,
     currentIds,
-    nextIds: dedupe(targetPlatformIds).filter((id) => platforms.some((p) => p.id === id)),
-    same: nextName === fileName
+    nextIds,
+    same: nextName === fileName,
+    // 丢失的平台（改名后检查器才会暴露部分失败的真实结果用）
+    lostIds: currentIds.filter((id) => !nextIds.includes(id))
   };
 }
 
@@ -264,14 +273,22 @@ export function analyzeCoverage(photos, platforms = DEFAULT_PLATFORMS) {
  * 返回 [{ to, names: [原文件名...] }]
  */
 export function findNameClashes(photos, platformIds, platforms = DEFAULT_PLATFORMS) {
+  const plans = (photos || []).map((ph) => computeRename(ph.name, platformIds, platforms));
+  // 本批次里会被腾空的原始文件名（这些名字执行时必然消失，不算占位冲突）
+  const vacated = new Set(plans.filter((r) => !r.same).map((r) => r.from.toLowerCase()));
   const byTarget = new Map();
-  for (const ph of photos || []) {
-    const r = computeRename(ph.name, platformIds, platforms);
+  for (const r of plans) {
     const key = r.to.toLowerCase();
     if (!byTarget.has(key)) byTarget.set(key, { to: r.to, names: [] });
-    byTarget.get(key).names.push(ph.name);
+    byTarget.get(key).names.push(r.from);
   }
-  return [...byTarget.values()].filter((x) => x.names.length > 1);
+  return [...byTarget.values()].filter((x) => {
+    // 目标名与本批次中「别的」即将改名的文件原同名：执行时会先腾位，不互相覆盖
+    const originSurvives = x.names.some((n) => n.toLowerCase() === x.to.toLowerCase());
+    const blockedByVacated = !originSurvives && vacated.has(x.to.toLowerCase());
+    if (blockedByVacated) return false;
+    return x.names.length > 1;
+  });
 }
 
 /**
@@ -296,15 +313,17 @@ export function planBatch({ photos, platformIds, note, root, date = new Date(), 
   const renames = photos.map((ph) => computeRename(ph.name, platformIds, platforms));
 
   // 复制计划：复制的文件沿用「改名后」的名字，便于与原片对应
-  const srcByName = new Map(photos.map((p) => [p.name, p.src]));
+  const srcByName = new Map(photos.map((p) => [p.name, p.src || p.path]));
   const copies = [];
   for (const f of folders) {
     for (const r of renames) {
+      const src = srcByName.get(r.from);
+      if (!src) continue; // 没有来源路径的条目不入计划，避免执行期空指针
       copies.push({
         platformId: f.platformId,
         folderName: f.folderName,
         fileName: r.to,
-        src: srcByName.get(r.from)
+        src
       });
     }
   }
@@ -358,17 +377,35 @@ export function normalizeShortcut(expr) {
   return out.key ? out : null;
 }
 
+/**
+ * 按键归一化：
+ *  - Backspace / Delete 在部分键盘布局下 event.key 是「⌫」或「Delete」
+ *  - 中文输入法或 Ctrl 组合下英文字母会变成控制字符，需要回落到 e.code
+ * 保证「设置里录什么，运行时就能匹配到什么」。
+ */
+export function normalizeKeyName(rawKey, code) {
+  if (rawKey === ' ') return 'Space';
+  if (rawKey === '⌫' || rawKey === 'Backspace') return 'Backspace';
+  if (rawKey === 'Del' || rawKey === 'ForwardDelete') return 'Delete';
+  // 控制字符（Ctrl+A、输入法合成）→ 用物理键位还原字母
+  if (rawKey && rawKey.length === 1 && rawKey.charCodeAt(0) < 32 && typeof code === 'string') {
+    const m = /^Key([A-Z])$/.exec(code);
+    if (m) return m[1];
+    const d = /^Digit(\d)$/.exec(code);
+    if (d) return d[1];
+  }
+  if (typeof rawKey === 'string' && rawKey.length === 1) return rawKey.toUpperCase();
+  return rawKey;
+}
+
 /** 把键盘事件转换为 {cmd,shift,alt,ctrl,key}，与 normalizeShortcut 对比 */
 export function eventToCombo(e) {
-  let key = e.key;
-  if (key === ' ') key = 'Space';
-  if (key.length === 1) key = key.toUpperCase();
   return {
     cmd: !!e.metaKey,
     shift: !!e.shiftKey,
     alt: !!e.altKey,
     ctrl: !!e.ctrlKey,
-    key
+    key: normalizeKeyName(e.key, e.code)
   };
 }
 
@@ -393,13 +430,28 @@ export function validatePlatforms(platforms) {
   const list = platforms || [];
   const emojiMap = new Map();
   const keyMap = new Map();
+  if (list.length > 9) {
+    issues.push({ index: 0, kind: 'count', msg: '平台数量最多 9 个（快捷数字键 1-9）' });
+  }
   list.forEach((p, i) => {
-    if (!String(p.name || '').trim()) issues.push({ index: i, kind: 'name', msg: '平台名称不能为空' });
-    if (!String(p.emoji || '').trim()) issues.push({ index: i, kind: 'emoji', msg: '标记 emoji 不能为空' });
-    if (p.emoji && emojiMap.has(p.emoji)) {
-      issues.push({ index: i, kind: 'emoji', msg: `标记「${p.emoji}」与「${list[emojiMap.get(p.emoji)].name}」重复` });
-    } else if (p.emoji) {
-      emojiMap.set(p.emoji, i);
+    const name = String(p.name || '').trim();
+    const emoji = String(p.emoji || '').trim();
+    if (!name) issues.push({ index: i, kind: 'name', msg: '平台名称不能为空' });
+    if (!emoji) issues.push({ index: i, kind: 'emoji', msg: '标记 emoji 不能为空' });
+    // emoji 会写进文件名：禁止路径分隔符与非法字符
+    if (emoji && MARK_SAFE_CHARS.test(emoji)) {
+      MARK_SAFE_CHARS.lastIndex = 0;
+      issues.push({ index: i, kind: 'emoji', msg: `标记「${emoji}」含文件名非法字符` });
+    }
+    // 文件名里的标记必须是短字符（emoji 或 1-3 个字符），否则极易误删正常文件名
+    if (emoji && [...emoji].length > 4) {
+      issues.push({ index: i, kind: 'emoji', msg: `标记「${emoji}」过长（最多 4 个字符）` });
+    }
+    const ekey = normalizeEmoji(emoji);
+    if (emoji && emojiMap.has(ekey)) {
+      issues.push({ index: i, kind: 'emoji', msg: `标记「${emoji}」与「${list[emojiMap.get(ekey)].name}」重复` });
+    } else if (emoji) {
+      emojiMap.set(ekey, i);
     }
     const sc = String(p.shortcut || '').trim();
     if (sc && keyMap.has(sc)) {
@@ -411,9 +463,26 @@ export function validatePlatforms(platforms) {
   return issues;
 }
 
+/** 默认快捷键（与主进程 DEFAULT_SHORTCUTS 保持一致，供设置页「恢复默认」使用） */
+export const DEFAULT_SHORTCUTS = {
+  next: 'ArrowRight',
+  prev: 'ArrowLeft',
+  rowNext: 'ArrowDown',
+  rowPrev: 'ArrowUp',
+  preview: 'Space',
+  selectAll: '⌘+A',
+  clearSelection: 'Escape',
+  addToBatch: 'Enter',
+  togglePlatform1: '1',
+  togglePlatform2: '2',
+  togglePlatform3: '3',
+  openChecker: '⌘+L',
+  openSettings: '⌘+,'
+};
+
 /** 平台配置是否有致命问题（有则不允许保存） */
 export function hasFatalPlatformIssue(issues) {
-  return (issues || []).some((x) => x.kind === 'name' || x.kind === 'emoji');
+  return (issues || []).some((x) => x.kind === 'name' || x.kind === 'emoji' || x.kind === 'count');
 }
 
 /** 生成默认的新平台对象（自动挑未占用的颜色与数字键） */
